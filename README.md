@@ -1,4 +1,8 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+This is the Club Hub Prospect Engine V1, a Next.js app for Google Places prospect search, OpenAI enrichment, de-dupe, and email validation.
+
+For the complete A-to-Z developer documentation, see:
+
+[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)
 
 ## Getting Started
 
