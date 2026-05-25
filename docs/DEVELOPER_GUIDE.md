@@ -17,8 +17,9 @@ The application supports this workflow:
 7. Validate public contact emails with Bulk Email Checker.
 8. Move invalid email rows to `public.prospects_invalid_emails`.
 9. Keep valid, unknown, and error email rows active in `public.prospects`.
+10. Export active contacts and school/company fields as a HubSpot-ready CSV.
 
-V1 intentionally does not include auth, CSV export, background jobs, queues, cron, Instantly, email drafting, multiple contacts per school, or a CRM-style multi-page UI.
+V1 intentionally does not include auth, background jobs, queues, cron, Instantly, email drafting, or a CRM-style multi-page UI.
 
 ## 2. Tech Stack
 
@@ -52,8 +53,14 @@ src/
           route.ts
         validate-emails/
           route.ts
+        export-hubspot/
+          route.ts
   lib/
     googlePlaces.ts
+    hubspot/
+      exportHeaders.ts
+      normalizers.ts
+      buildHubspotCsv.ts
     supabaseServer.ts
     openai/
       enrichment-prompt.ts
@@ -73,8 +80,10 @@ Important files:
 - `src/app/api/prospects/enrich/route.ts`: OpenAI enrichment flow.
 - `src/app/api/prospects/dedupe/route.ts`: Duplicate archive and removal flow.
 - `src/app/api/prospects/validate-emails/route.ts`: Bulk Email Checker validation flow.
+- `src/app/api/prospects/export-hubspot/route.ts`: HubSpot CSV download flow.
 - `src/lib/supabaseServer.ts`: Server-only Supabase client.
 - `src/lib/googlePlaces.ts`: Google Places request, response types, address parsing, and row mapping.
+- `src/lib/hubspot/*`: HubSpot export headers, normalization, and CSV generation.
 - `src/lib/openai/enrichment-schema.ts`: Strict structured output schema and zod validator.
 - `src/lib/openai/enrichment-prompt.ts`: OpenAI enrichment worker instructions.
 - `src/types/prospect.ts`: Shared UI/API prospect list item types.
@@ -168,6 +177,7 @@ Buttons:
 - `Enhance Unenriched Prospects`: Calls `POST /api/prospects/enrich` with `{ "limit": 5 }`.
 - `De-Dupe Prospects`: Calls `POST /api/prospects/dedupe`.
 - `Validate Emails`: Calls `POST /api/prospects/validate-emails` with `{ "limit": 50 }`.
+- `Download HubSpot CSV`: Navigates to `GET /api/prospects/export-hubspot`.
 
 Loading state:
 
@@ -205,7 +215,7 @@ Status display:
 - `enrichment_status`
 - Falls back to `raw`
 
-The UI intentionally does not expose archive tables, deleted duplicates, invalid emails, CSV export, or outbound email actions.
+The UI intentionally does not expose archive tables, deleted duplicates, invalid emails, or outbound email actions.
 
 ## 7. Supabase Server Client
 
@@ -242,6 +252,7 @@ Client-side code does not import this file.
 V1 expects these Supabase tables to already exist:
 
 - `public.prospects`
+- `public.prospect_contacts`
 - `public.prospects_duplicates`
 - `public.prospects_invalid_emails`
 
@@ -304,6 +315,42 @@ bec_details
 bec_raw_json
 raw_google_json
 raw_openai_json
+company_owner
+street_address
+state_region_code
+postal_code
+time_zone
+industry
+company_type
+record_source
+religion
+school_structure
+school_structure_boy_girl
+school_structure_day_boarding
+school_divisions
+low_grade
+high_grade
+number_of_students
+number_of_clubs
+list_of_clubs
+clubs_letter_grade
+percent_clubs_get_funding
+percent_lots_of_participation
+percent_plenty_of_clubs
+tuition
+niche_ranking
+number_of_employees_range
+annual_revenue
+subscription_year
+description
+linkedin_company_page
+reference_school
+reference_school_reason
+ai_fit_reason
+source_url
+data_confidence
+export_notes
+exported_at
 ```
 
 Recommended unique index:
@@ -315,7 +362,44 @@ on public.prospects (google_place_id);
 
 The Google save route has a fallback if this index is missing, but production should have it.
 
-### 8.2 `public.prospects_duplicates`
+Run `docs/supabase_hubspot_export_migration.sql` in the Supabase SQL Editor to add HubSpot export columns and backfill legacy contact data.
+
+### 8.2 `public.prospect_contacts`
+
+People/contact table related to `public.prospects`. It stores contact rows only; school/company data remains in `public.prospects`.
+
+Fields:
+
+```txt
+id
+prospect_id
+first_name
+last_name
+email
+phone_number
+job_title
+contact_owner
+lead_status
+contact_rank
+sequence_pick
+sequence_name
+best_contact_reason
+email_validation_status
+contact_source_url
+contact_confidence
+notes
+created_at
+updated_at
+```
+
+Recommended unique index:
+
+```sql
+create unique index if not exists prospect_contacts_prospect_email_key
+on public.prospect_contacts (prospect_id, lower(email));
+```
+
+### 8.3 `public.prospects_duplicates`
 
 Archive table for duplicate rows moved out of `public.prospects`.
 
@@ -338,7 +422,7 @@ original_prospect_id
 
 The de-dupe route uses upsert on `original_prospect_id`.
 
-### 8.3 `public.prospects_invalid_emails`
+### 8.4 `public.prospects_invalid_emails`
 
 Archive table for rows whose `contact_email` fails Bulk Email Checker validation.
 
@@ -997,6 +1081,45 @@ No work response:
 }
 ```
 
+### 9.6 `GET /api/prospects/export-hubspot`
+
+Purpose:
+
+- Download active prospects and related contact rows as a HubSpot import CSV.
+- One row equals one contact.
+- School/company fields repeat on every contact row.
+
+Supabase query:
+
+- Table: `prospects`
+- Table: `prospect_contacts`
+- Limit: `10000` rows per table query
+
+Export behavior:
+
+- Excludes contacts with missing email.
+- Excludes contacts whose email status normalizes to `Invalid`.
+- Excludes rows with missing company name or missing company domain.
+- Uses `prospect_contacts` rows when present.
+- Falls back to legacy `prospects.contact_*` fields when a prospect has no contact rows.
+- Defaults missing operational fields:
+  - Contact owner: `Paul Knox`
+  - Company owner: `Paul Knox`
+  - Lead Status: `New`
+  - Record source: `Import`
+  - Industry: `Education Management`
+  - Sequence Name: `Club Hub - V1 School Outreach`
+- Computes `Sequence Pick` at export time so only the first rank `1` contact per school exports `TRUE`.
+- Leaves `Time Zone` blank.
+- Normalizes HubSpot enum, currency, percentage, number, domain, and email status values.
+
+Response headers:
+
+```txt
+Content-Type: text/csv; charset=utf-8
+Content-Disposition: attachment; filename="club-hub-hubspot-upload.csv"
+```
+
 ## 10. External API Integrations
 
 ### 10.1 Google Places API New Text Search
@@ -1137,6 +1260,14 @@ prospects invalid email -> prospects_invalid_emails archive -> delete invalid ro
 
 Valid, unknown, skipped, and error rows remain in `prospects`.
 
+### 11.5 HubSpot export
+
+```txt
+prospects + prospect_contacts -> normalize values -> HubSpot CSV download
+```
+
+Invalid emails are excluded from the CSV. The export route does not create, update, archive, or delete database rows.
+
 ## 12. Error Handling Strategy
 
 All routes return clean JSON errors. They do not expose secret values.
@@ -1162,6 +1293,7 @@ Examples:
 - `OpenAI returned invalid JSON.`
 - `Duplicate archive insert failure.`
 - `Duplicate delete failure.`
+- `Supabase contact select failure.`
 
 Batch routes continue per row where appropriate:
 
@@ -1265,6 +1397,7 @@ src/app/api/prospects/google-search/route.ts
 src/app/api/prospects/enrich/route.ts
 src/app/api/prospects/dedupe/route.ts
 src/app/api/prospects/validate-emails/route.ts
+src/app/api/prospects/export-hubspot/route.ts
 ```
 
 If production is a redeploy of an old starter commit, promote a fresh deployment from `main`.
@@ -1327,6 +1460,23 @@ state: IL
 6. Confirm error rows remain with `email_validation_status = error`.
 7. Confirm invalid rows move into `prospects_invalid_emails`.
 8. Confirm invalid rows disappear from active table.
+
+### 15.6 HubSpot CSV export
+
+1. Run `docs/supabase_hubspot_export_migration.sql` in Supabase SQL Editor.
+2. Ensure at least one active prospect has a contact row or legacy contact fields.
+3. Click `Download HubSpot CSV`.
+4. Confirm the downloaded filename is:
+
+```txt
+club-hub-hubspot-upload.csv
+```
+
+5. Confirm the header row exactly matches `src/lib/hubspot/exportHeaders.ts`.
+6. Confirm invalid emails are excluded.
+7. Confirm `Time Zone` is blank.
+8. Confirm currency and percentage fields contain numbers only.
+9. Confirm only one rank `1` contact per school has `Sequence Pick = TRUE`.
 
 ## 16. Troubleshooting
 
@@ -1408,7 +1558,17 @@ Check Vercel deployment source:
 - Production branch should be `main`.
 - If the finished app is only a preview deployment, promote that deployment to production.
 
-### 16.7 Dark Reader hydration warning
+### 16.7 HubSpot export fails
+
+Common causes:
+
+- `docs/supabase_hubspot_export_migration.sql` has not been run.
+- `public.prospect_contacts` is missing.
+- HubSpot export columns are missing from `public.prospects`.
+- Active prospects have no contact email.
+- Active prospects are missing a website/source URL that can produce Company Domain Name.
+
+### 16.8 Dark Reader hydration warning
 
 If browser console shows `data-darkreader-*` hydration mismatch, it is caused by the Dark Reader browser extension modifying the HTML. It is not an app error.
 
@@ -1417,13 +1577,10 @@ If browser console shows `data-darkreader-*` hydration mismatch, it is caused by
 V1 does not include:
 
 - Auth/login.
-- CSV export.
 - Instantly push.
 - Background jobs.
 - Cron.
 - Queues.
-- Multiple contacts per school.
-- Separate contacts table.
 - Manual review queue.
 - Email drafting.
 - Email validation beyond Bulk Email Checker.
@@ -1444,8 +1601,7 @@ These are not implemented in V1:
 5. Add restore flows for duplicate and invalid-email archives.
 6. Add rate limiting on mutation routes.
 7. Add job queue for large enrichment and validation batches.
-8. Add CSV export after data quality gates.
-9. Add contact review before outbound automation.
+8. Add contact review before outbound automation.
 
 ## 19. Quick Route Reference
 
@@ -1455,6 +1611,7 @@ POST /api/prospects/google-search
 POST /api/prospects/enrich
 POST /api/prospects/dedupe
 POST /api/prospects/validate-emails
+GET  /api/prospects/export-hubspot
 ```
 
 ## 20. Current Validation Status
@@ -1467,4 +1624,3 @@ npm run build
 ```
 
 Both passed after the V1 route and UI implementation.
-

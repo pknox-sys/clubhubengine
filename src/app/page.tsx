@@ -190,6 +190,10 @@ export default function Home() {
     }
   }
 
+  function handleDownloadHubSpotCsv() {
+    window.location.href = "/api/prospects/export-hubspot";
+  }
+
   const isLoading =
     isLoadingRecent ||
     isSearching ||
@@ -212,7 +216,7 @@ export default function Home() {
 
         <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
           <form
-            className="grid gap-4 xl:grid-cols-[minmax(220px,1.2fr)_minmax(160px,0.8fr)_100px_repeat(5,minmax(140px,auto))]"
+            className="grid gap-4 xl:grid-cols-[minmax(220px,1.2fr)_minmax(160px,0.8fr)_100px_repeat(6,minmax(140px,auto))]"
             onSubmit={handleSubmit}
           >
             <label className="flex flex-col gap-2 text-sm font-medium text-slate-700">
@@ -305,6 +309,17 @@ export default function Home() {
                 type="button"
               >
                 {isEmailValidationRunning ? "Validating..." : "Validate Emails"}
+              </button>
+            </div>
+
+            <div className="flex items-end">
+              <button
+                className="h-11 w-full rounded-md bg-sky-700 px-4 text-sm font-semibold text-white transition hover:bg-sky-800 disabled:cursor-not-allowed disabled:bg-sky-300"
+                disabled={isLoading}
+                onClick={handleDownloadHubSpotCsv}
+                type="button"
+              >
+                Download HubSpot CSV
               </button>
             </div>
           </form>
