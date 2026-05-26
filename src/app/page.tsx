@@ -66,9 +66,97 @@ type EnrichmentPanel = {
   results: EnrichResultItem[];
 };
 
+type BatchSearchResult = {
+  city: string;
+  state: string;
+  status: "saved" | "failed";
+  count: number;
+  run_id?: string;
+  run_name?: string;
+  error?: string;
+};
+
+type BatchSearchPanel = {
+  message: string;
+  total_cities: number;
+  runs_created: number;
+  total_prospects_saved: number;
+  failed_cities: number;
+  results: BatchSearchResult[];
+};
+
 type ActionResponse = {
   message?: string;
   error?: string;
+};
+
+type DedupeResponse = ActionResponse & {
+  total_checked?: number;
+  duplicate_groups_found?: number;
+  duplicates_moved?: number;
+  canonical_records_updated?: number;
+  contacts_moved_or_merged?: number;
+  run_memberships_moved_or_merged?: number;
+  active_prospects_remaining?: number;
+  per_group_results?: DedupeGroupResult[];
+};
+
+type DedupeGroupResult = {
+  canonical_prospect_id?: string | number;
+  canonical_school_name?: string;
+  duplicate_ids?: Array<string | number>;
+  duplicate_school_names?: string[];
+  contacts_moved_or_merged?: number;
+  run_memberships_moved_or_merged?: number;
+  error?: string;
+};
+
+type DedupePanel = {
+  message: string;
+  total_checked: number;
+  duplicate_groups_found: number;
+  duplicates_moved: number;
+  canonical_records_updated: number;
+  contacts_moved_or_merged: number;
+  run_memberships_moved_or_merged: number;
+  active_prospects_remaining: number;
+  per_group_results: DedupeGroupResult[];
+};
+
+type ValidationResultItem = {
+  target_type?: "contact" | "legacy";
+  prospect_id?: string | number;
+  contact_id?: string | number;
+  school_name?: string;
+  contact_name?: string;
+  email?: string;
+  status?: "Valid" | "Invalid" | "Unknown" | "Error" | "Skipped";
+  event?: string | null;
+  details?: string | null;
+  error?: string | null;
+};
+
+type ValidationResponse = ActionResponse & {
+  checked?: number;
+  valid?: number;
+  invalid?: number;
+  unknown?: number;
+  errors?: number;
+  skipped?: number;
+  scope?: string;
+  results?: ValidationResultItem[];
+};
+
+type ValidationPanel = {
+  scope: string;
+  message: string;
+  checked: number;
+  valid: number;
+  invalid: number;
+  unknown: number;
+  errors: number;
+  skipped: number;
+  results: ValidationResultItem[];
 };
 
 type ProspectFilters = {
@@ -81,6 +169,7 @@ type ProspectFilters = {
   contactRank: string;
   dataConfidence: string;
   hasEmail: string;
+  minStudents: string;
 };
 
 const DEFAULT_KEYWORD = "private high school";
@@ -96,14 +185,19 @@ const EMPTY_FILTERS: ProspectFilters = {
   contactRank: "",
   dataConfidence: "",
   hasEmail: "",
+  minStudents: "",
 };
 
 export default function Home() {
   const [keyword, setKeyword] = useState(DEFAULT_KEYWORD);
   const [city, setCity] = useState(DEFAULT_CITY);
   const [state, setState] = useState(DEFAULT_STATE);
+  const [batchCities, setBatchCities] = useState("");
   const [runs, setRuns] = useState<ProspectRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
+  const [selectedProcessRunIds, setSelectedProcessRunIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [filters, setFilters] = useState<ProspectFilters>(EMPTY_FILTERS);
   const [prospects, setProspects] = useState<ProspectListItem[]>([]);
   const [selectedProspectIds, setSelectedProspectIds] = useState<Set<string>>(
@@ -114,6 +208,11 @@ export default function Home() {
   );
   const [enrichmentPanel, setEnrichmentPanel] =
     useState<EnrichmentPanel | null>(null);
+  const [batchSearchPanel, setBatchSearchPanel] =
+    useState<BatchSearchPanel | null>(null);
+  const [dedupePanel, setDedupePanel] = useState<DedupePanel | null>(null);
+  const [validationPanel, setValidationPanel] =
+    useState<ValidationPanel | null>(null);
   const [isLoadingRecent, setIsLoadingRecent] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [isEnhancing, setIsEnhancing] = useState(false);
@@ -197,20 +296,17 @@ export default function Home() {
     setIsSearching(true);
     setMessage("");
     setError("");
+    setBatchSearchPanel(null);
 
     try {
-      const response = await fetch("/api/prospects/google-search", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ keyword, city, state }),
-      });
-      const payload = (await response.json()) as ProspectsResponse;
+      const batchTargets = parseBatchCities(batchCities, state);
 
-      if (!response.ok) {
-        throw new Error(payload.error ?? "Unable to save prospects.");
+      if (batchTargets.length > 0) {
+        await runBatchSearch(batchTargets);
+        return;
       }
+
+      const payload = await saveSearchRun({ keyword, city, state });
 
       await loadRuns();
 
@@ -232,6 +328,64 @@ export default function Home() {
     } finally {
       setIsSearching(false);
     }
+  }
+
+  async function runBatchSearch(
+    targets: Array<{ city: string; state: string }>,
+  ) {
+    const results: BatchSearchResult[] = [];
+
+    for (const target of targets) {
+      try {
+        const payload = await saveSearchRun({
+          keyword,
+          city: target.city,
+          state: target.state,
+        });
+
+        results.push({
+          city: target.city,
+          state: target.state,
+          status: "saved",
+          count: payload.count ?? payload.prospects?.length ?? 0,
+          run_id: payload.run_id,
+          run_name: payload.run_name,
+        });
+      } catch (batchError) {
+        results.push({
+          city: target.city,
+          state: target.state,
+          status: "failed",
+          count: 0,
+          error: getReadableError(batchError),
+        });
+      }
+    }
+
+    await loadRuns();
+    setSelectedRunId("");
+    setVisibleProspects(await fetchRecentProspects("", filters));
+
+    const runsCreated = results.filter((result) => result.run_id).length;
+    const totalProspectsSaved = results.reduce(
+      (total, result) => total + result.count,
+      0,
+    );
+    const failedCities = results.filter(
+      (result) => result.status === "failed",
+    ).length;
+    const message = `Batch search completed. ${runsCreated} runs created, ${totalProspectsSaved} prospects saved, ${failedCities} cities failed.`;
+
+    setBatchSearchPanel({
+      message,
+      total_cities: targets.length,
+      runs_created: runsCreated,
+      total_prospects_saved: totalProspectsSaved,
+      failed_cities: failedCities,
+      results,
+    });
+    setSelectedProspectIds(new Set());
+    setMessage(message);
   }
 
   async function handleRunChange(runId: string) {
@@ -341,7 +495,10 @@ export default function Home() {
     const runName =
       runs.find((run) => run.id === selectedRunId)?.name ?? "Current run";
 
-    await runEnrichment({ runId: selectedRunId }, runName);
+    await runEnrichment(
+      { runId: selectedRunId, ...getMinimumStudentsBody(filters) },
+      runName,
+    );
   }
 
   async function handleEnhanceLoadedRows() {
@@ -351,22 +508,45 @@ export default function Home() {
     );
   }
 
+  async function handleEnhanceSelectedRuns() {
+    const runIds = Array.from(selectedProcessRunIds);
+
+    await runEnrichment(
+      { runIds, ...getMinimumStudentsBody(filters) },
+      `${runIds.length} selected runs`,
+    );
+  }
+
   async function handleDedupe() {
     setIsDedupeRunning(true);
     setMessage("");
     setError("");
+    setDedupePanel(null);
 
     try {
       const response = await fetch("/api/prospects/dedupe", {
         method: "POST",
       });
-      const payload = (await response.json()) as ActionResponse;
+      const payload = (await response.json()) as DedupeResponse;
 
       if (!response.ok) {
         throw new Error(payload.error ?? "Unable to de-dupe prospects.");
       }
 
       await loadProspects();
+      setSelectedProspectIds(new Set());
+      setDedupePanel({
+        message: payload.message ?? "De-dupe completed.",
+        total_checked: payload.total_checked ?? 0,
+        duplicate_groups_found: payload.duplicate_groups_found ?? 0,
+        duplicates_moved: payload.duplicates_moved ?? 0,
+        canonical_records_updated: payload.canonical_records_updated ?? 0,
+        contacts_moved_or_merged: payload.contacts_moved_or_merged ?? 0,
+        run_memberships_moved_or_merged:
+          payload.run_memberships_moved_or_merged ?? 0,
+        active_prospects_remaining: payload.active_prospects_remaining ?? 0,
+        per_group_results: payload.per_group_results ?? [],
+      });
       setMessage(payload.message ?? "De-dupe completed.");
     } catch (dedupeError) {
       setError(getReadableError(dedupeError));
@@ -376,9 +556,60 @@ export default function Home() {
   }
 
   async function handleValidateEmails() {
+    await runEmailValidation({ limit: 50 }, "Global unvalidated contacts");
+  }
+
+  async function handleValidateSelectedRows() {
+    await runEmailValidation(
+      { prospectIds: Array.from(selectedProspectIds) },
+      `${selectedProspectIds.size} selected rows`,
+    );
+  }
+
+  async function handleValidateCurrentRun() {
+    const runName =
+      runs.find((run) => run.id === selectedRunId)?.name ?? "Current run";
+
+    await runEmailValidation(
+      { runId: selectedRunId, ...getMinimumStudentsBody(filters) },
+      runName,
+    );
+  }
+
+  async function handleValidateLoadedRows() {
+    await runEmailValidation(
+      { prospectIds: prospects.map((prospect) => idKey(prospect.id)) },
+      `${prospects.length} loaded / filtered rows`,
+    );
+  }
+
+  async function handleValidateSelectedRuns() {
+    const runIds = Array.from(selectedProcessRunIds);
+
+    await runEmailValidation(
+      { runIds, ...getMinimumStudentsBody(filters) },
+      `${runIds.length} selected runs`,
+    );
+  }
+
+  async function runEmailValidation(
+    body: Record<string, unknown>,
+    scope: string,
+  ) {
     setIsEmailValidationRunning(true);
     setMessage("");
     setError("");
+    setValidationPanel({
+      scope,
+      message: "Email validation is running...",
+      checked: 0,
+      valid: 0,
+      invalid: 0,
+      unknown: 0,
+      errors: 0,
+      skipped: 0,
+      results: [],
+    });
 
     try {
       const response = await fetch("/api/prospects/validate-emails", {
@@ -386,18 +617,38 @@ export default function Home() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ limit: 50 }),
+        body: JSON.stringify({ limit: 50, ...body }),
       });
-      const payload = (await response.json()) as ActionResponse;
+      const payload = (await response.json()) as ValidationResponse;
 
       if (!response.ok) {
         throw new Error(payload.error ?? "Unable to validate emails.");
       }
 
       await loadProspects();
+      setValidationPanel({
+        scope: payload.scope ?? scope,
+        message: payload.message ?? "Email validation completed.",
+        checked: payload.checked ?? 0,
+        valid: payload.valid ?? 0,
+        invalid: payload.invalid ?? 0,
+        unknown: payload.unknown ?? 0,
+        errors: payload.errors ?? 0,
+        skipped: payload.skipped ?? 0,
+        results: payload.results ?? [],
+      });
       setMessage(payload.message ?? "Email validation completed.");
     } catch (validationError) {
       setError(getReadableError(validationError));
+      setValidationPanel((current) =>
+        current
+          ? {
+              ...current,
+              message: getReadableError(validationError),
+              errors: current.errors || 1,
+            }
+          : current,
+      );
     } finally {
       setIsEmailValidationRunning(false);
     }
@@ -413,6 +664,14 @@ export default function Home() {
     const query = params.toString();
 
     window.location.href = `/api/prospects/export-hubspot${query ? `?${query}` : ""}`;
+  }
+
+  function handleExportSelectedRuns() {
+    const params = buildProspectQueryParams("", filters);
+    params.set("runIds", Array.from(selectedProcessRunIds).join(","));
+    const query = params.toString();
+
+    window.location.href = `/api/prospects/export-hubspot?${query}`;
   }
 
   function handleSelectCurrentPage() {
@@ -451,6 +710,24 @@ export default function Home() {
     });
   }
 
+  function handleToggleProcessRun(id: string) {
+    setSelectedProcessRunIds((current) => {
+      const next = new Set(current);
+
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+
+      return next;
+    });
+  }
+
+  function handleClearProcessRuns() {
+    setSelectedProcessRunIds(new Set());
+  }
+
   const isLoading =
     isLoadingRecent ||
     isSearching ||
@@ -477,17 +754,32 @@ export default function Home() {
             onSubmit={handleSubmit}
           >
             <TextInput label="Keyword" minLength={2} onChange={setKeyword} value={keyword} />
-            <TextInput label="City" minLength={2} onChange={setCity} value={city} />
+            <TextInput
+              label="City"
+              minLength={batchCities.trim() ? undefined : 2}
+              onChange={setCity}
+              value={city}
+            />
             <TextInput
               label="State"
-              minLength={2}
+              minLength={batchCities.trim() ? undefined : 2}
               onChange={setState}
               value={state}
               uppercase
             />
+            <TextAreaInput
+              label="Batch Cities"
+              onChange={setBatchCities}
+              placeholder={"Naperville, IL\nJoliet, IL\nAurora, IL"}
+              value={batchCities}
+            />
 
             <ActionButton disabled={isLoading} primary type="submit">
-              {isSearching ? "Searching..." : "Search"}
+              {isSearching
+                ? "Searching..."
+                : batchCities.trim()
+                  ? "Search Batch"
+                  : "Search"}
             </ActionButton>
 
             <ActionButton disabled={isLoading} onClick={loadRecentProspects}>
@@ -507,7 +799,7 @@ export default function Home() {
               disabled={isLoading}
               onClick={handleDedupe}
             >
-              {isDedupeRunning ? "De-duping..." : "De-Dupe Prospects"}
+              {isDedupeRunning ? "De-duping..." : "De-Dupe All Prospects"}
             </ActionButton>
 
             <ActionButton
@@ -629,6 +921,83 @@ export default function Home() {
                 { label: "Missing email", value: "false" },
               ]}
             />
+            <TextInput
+              label="Minimum Students"
+              onChange={(value) => handleFilterChange("minStudents", value)}
+              type="number"
+              value={filters.minStudents}
+            />
+          </div>
+
+          <div className="mt-5 border-t border-slate-200 pt-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">
+                  Runs to Process
+                </h2>
+                <p className="mt-1 text-xs leading-5 text-slate-500">
+                  Select multiple runs for batch enhancement, validation, or
+                  export. Current filters, including Minimum Students, apply
+                  when sent with run-based actions.
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <ActionButton
+                  className="bg-emerald-700 text-white hover:bg-emerald-800 disabled:bg-emerald-300"
+                  disabled={isLoading || selectedProcessRunIds.size === 0}
+                  onClick={handleEnhanceSelectedRuns}
+                >
+                  Enhance Selected Runs
+                </ActionButton>
+                <ActionButton
+                  className="bg-amber-600 text-white hover:bg-amber-700 disabled:bg-amber-300"
+                  disabled={isLoading || selectedProcessRunIds.size === 0}
+                  onClick={handleValidateSelectedRuns}
+                >
+                  Validate Selected Runs
+                </ActionButton>
+                <ActionButton
+                  className="bg-sky-700 text-white hover:bg-sky-800 disabled:bg-sky-300"
+                  disabled={isLoading || selectedProcessRunIds.size === 0}
+                  onClick={handleExportSelectedRuns}
+                >
+                  Export Selected Runs
+                </ActionButton>
+                <ActionButton
+                  disabled={isLoading || selectedProcessRunIds.size === 0}
+                  onClick={handleClearProcessRuns}
+                >
+                  Clear Runs
+                </ActionButton>
+              </div>
+            </div>
+            <div className="mt-3 grid max-h-44 gap-2 overflow-y-auto rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-2 xl:grid-cols-3">
+              {runs.length > 0 ? (
+                runs.map((run) => (
+                  <label
+                    className="flex items-start gap-2 rounded-md bg-white p-2 text-xs text-slate-700"
+                    key={run.id}
+                  >
+                    <input
+                      checked={selectedProcessRunIds.has(run.id)}
+                      className="mt-1 h-4 w-4"
+                      onChange={() => handleToggleProcessRun(run.id)}
+                      type="checkbox"
+                    />
+                    <span>
+                      <span className="block font-semibold text-slate-900">
+                        {run.name}
+                      </span>
+                      <span className="block text-slate-500">
+                        {run.saved_count ?? 0} saved
+                      </span>
+                    </span>
+                  </label>
+                ))
+              ) : (
+                <p className="text-sm text-slate-500">No runs loaded.</p>
+              )}
+            </div>
           </div>
 
           <div className="mt-5 flex flex-col gap-3 border-t border-slate-200 pt-4">
@@ -660,6 +1029,33 @@ export default function Home() {
               run or loaded filtered rows. The general enhancement button keeps
               the original unenriched-prospect behavior.
             </p>
+            <div className="flex flex-wrap gap-3">
+              <ActionButton
+                className="bg-amber-600 text-white hover:bg-amber-700 disabled:bg-amber-300"
+                disabled={isLoading || selectedProspectIds.size === 0}
+                onClick={handleValidateSelectedRows}
+              >
+                Validate Selected Rows
+              </ActionButton>
+              <ActionButton
+                className="bg-amber-600 text-white hover:bg-amber-700 disabled:bg-amber-300"
+                disabled={isLoading || !selectedRunId}
+                onClick={handleValidateCurrentRun}
+              >
+                Validate Current Run
+              </ActionButton>
+              <ActionButton
+                className="bg-amber-600 text-white hover:bg-amber-700 disabled:bg-amber-300"
+                disabled={isLoading || prospects.length === 0}
+                onClick={handleValidateLoadedRows}
+              >
+                Validate All Loaded / Filtered Rows
+              </ActionButton>
+            </div>
+            <p className="text-xs leading-5 text-slate-500">
+              Validation updates linked contact rows in place. Invalid contacts
+              stay visible but are excluded from HubSpot export.
+            </p>
           </div>
 
           <div className="mt-4 min-h-6 text-sm">
@@ -667,10 +1063,20 @@ export default function Home() {
             {error ? <p className="text-red-700">{error}</p> : null}
           </div>
 
+          {batchSearchPanel ? (
+            <BatchSearchStatusPanel panel={batchSearchPanel} />
+          ) : null}
           {enrichmentPanel ? (
             <EnrichmentStatusPanel
               isRunning={isEnhancing}
               panel={enrichmentPanel}
+            />
+          ) : null}
+          {dedupePanel ? <DedupeStatusPanel panel={dedupePanel} /> : null}
+          {validationPanel ? (
+            <EmailValidationStatusPanel
+              isRunning={isEmailValidationRunning}
+              panel={validationPanel}
             />
           ) : null}
         </section>
@@ -841,6 +1247,53 @@ export default function Home() {
   );
 }
 
+function BatchSearchStatusPanel({ panel }: { panel: BatchSearchPanel }) {
+  return (
+    <div className="mt-4 rounded-lg border border-sky-200 bg-sky-50 p-4 text-sm">
+      <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+        <div>
+          <h3 className="font-semibold text-sky-950">Batch Search Results</h3>
+          <p className="mt-1 text-sky-800">{panel.message}</p>
+        </div>
+        <div className="grid grid-cols-4 gap-3 text-center text-xs text-sky-950">
+          <Metric label="Cities" value={panel.total_cities} />
+          <Metric label="Runs" value={panel.runs_created} />
+          <Metric label="Saved" value={panel.total_prospects_saved} />
+          <Metric label="Failed" value={panel.failed_cities} />
+        </div>
+      </div>
+      {panel.results.length > 0 ? (
+        <div className="mt-3 overflow-x-auto rounded-md border border-sky-200 bg-white">
+          <table className="min-w-[760px] text-left text-xs">
+            <thead className="bg-sky-100 text-sky-950">
+              <tr>
+                <TableHeader>City</TableHeader>
+                <TableHeader>State</TableHeader>
+                <TableHeader>Status</TableHeader>
+                <TableHeader>Saved</TableHeader>
+                <TableHeader>Run</TableHeader>
+                <TableHeader>Error</TableHeader>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-sky-100">
+              {panel.results.map((result, index) => (
+                <tr key={`${result.city}:${result.state}:${index}`}>
+                  <TableCell>{result.city}</TableCell>
+                  <TableCell>{result.state}</TableCell>
+                  <TableCell>{result.status}</TableCell>
+                  <TableCell>{result.count}</TableCell>
+                  <TableCell>{result.run_name || "-"}</TableCell>
+                  <TableCell>{result.error || "-"}</TableCell>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function EnrichmentStatusPanel({
   isRunning,
   panel,
@@ -908,11 +1361,130 @@ function EnrichmentStatusPanel({
   );
 }
 
+function DedupeStatusPanel({ panel }: { panel: DedupePanel }) {
+  return (
+    <div className="mt-4 rounded-lg border border-indigo-200 bg-indigo-50 p-4 text-sm">
+      <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+        <div>
+          <h3 className="font-semibold text-indigo-950">Dedupe Results</h3>
+          <p className="mt-1 text-indigo-800">{panel.message}</p>
+        </div>
+        <div className="grid grid-cols-3 gap-3 text-center text-xs text-indigo-950 lg:grid-cols-7">
+          <Metric label="Checked" value={panel.total_checked} />
+          <Metric label="Groups" value={panel.duplicate_groups_found} />
+          <Metric label="Moved" value={panel.duplicates_moved} />
+          <Metric label="Canonical" value={panel.canonical_records_updated} />
+          <Metric label="Contacts" value={panel.contacts_moved_or_merged} />
+          <Metric label="Runs" value={panel.run_memberships_moved_or_merged} />
+          <Metric label="Active" value={panel.active_prospects_remaining} />
+        </div>
+      </div>
+      {panel.per_group_results.length > 0 ? (
+        <div className="mt-3 overflow-x-auto rounded-md border border-indigo-200 bg-white">
+          <table className="min-w-[980px] text-left text-xs">
+            <thead className="bg-indigo-100 text-indigo-950">
+              <tr>
+                <TableHeader>Canonical</TableHeader>
+                <TableHeader>Duplicates</TableHeader>
+                <TableHeader>Contacts Merged</TableHeader>
+                <TableHeader>Run Memberships</TableHeader>
+                <TableHeader>Error</TableHeader>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-indigo-100">
+              {panel.per_group_results.map((result, index) => (
+                <tr key={`${result.canonical_prospect_id ?? index}`}>
+                  <TableCell>{result.canonical_school_name || "-"}</TableCell>
+                  <TableCell>
+                    {(result.duplicate_school_names ?? [])
+                      .filter(Boolean)
+                      .join(", ") || "-"}
+                  </TableCell>
+                  <TableCell>{result.contacts_moved_or_merged ?? 0}</TableCell>
+                  <TableCell>
+                    {result.run_memberships_moved_or_merged ?? 0}
+                  </TableCell>
+                  <TableCell>{result.error || "-"}</TableCell>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function EmailValidationStatusPanel({
+  isRunning,
+  panel,
+}: {
+  isRunning: boolean;
+  panel: ValidationPanel;
+}) {
+  return (
+    <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm">
+      <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+        <div>
+          <h3 className="font-semibold text-amber-950">
+            Email Validation Results
+          </h3>
+          <p className="mt-1 text-amber-800">
+            Scope: {panel.scope}
+            {isRunning ? " - running" : ""}
+          </p>
+        </div>
+        <div className="grid grid-cols-3 gap-3 text-center text-xs text-amber-950 lg:grid-cols-6">
+          <Metric label="Checked" value={panel.checked} />
+          <Metric label="Valid" value={panel.valid} />
+          <Metric label="Invalid" value={panel.invalid} />
+          <Metric label="Unknown" value={panel.unknown} />
+          <Metric label="Errors" value={panel.errors} />
+          <Metric label="Skipped" value={panel.skipped} />
+        </div>
+      </div>
+      <p className="mt-3 text-amber-800">{panel.message}</p>
+      {panel.results.length > 0 ? (
+        <div className="mt-3 overflow-x-auto rounded-md border border-amber-200 bg-white">
+          <table className="min-w-[1120px] text-left text-xs">
+            <thead className="bg-amber-100 text-amber-950">
+              <tr>
+                <TableHeader>School</TableHeader>
+                <TableHeader>Contact</TableHeader>
+                <TableHeader>Email</TableHeader>
+                <TableHeader>Type</TableHeader>
+                <TableHeader>Status</TableHeader>
+                <TableHeader>Event</TableHeader>
+                <TableHeader>Details</TableHeader>
+                <TableHeader>Error</TableHeader>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-amber-100">
+              {panel.results.map((result, index) => (
+                <tr key={`${result.contact_id ?? result.prospect_id ?? index}:${index}`}>
+                  <TableCell>{result.school_name || "-"}</TableCell>
+                  <TableCell>{result.contact_name || "-"}</TableCell>
+                  <TableCell>{result.email || "-"}</TableCell>
+                  <TableCell>{result.target_type || "-"}</TableCell>
+                  <TableCell>{result.status || "-"}</TableCell>
+                  <TableCell>{result.event || "-"}</TableCell>
+                  <TableCell>{result.details || "-"}</TableCell>
+                  <TableCell>{result.error || "-"}</TableCell>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Metric({ label, value }: { label: string; value: number }) {
   return (
-    <div className="rounded-md border border-emerald-200 bg-white px-3 py-2">
+    <div className="rounded-md border border-slate-200 bg-white px-3 py-2">
       <span className="block text-base font-semibold">{value}</span>
-      <span className="block text-[11px] uppercase text-emerald-700">
+      <span className="block text-[11px] uppercase text-slate-600">
         {label}
       </span>
     </div>
@@ -1008,6 +1580,30 @@ function TextInput({
         onChange={(event) => onChange(event.target.value)}
         required={Boolean(minLength)}
         type={type}
+        value={value}
+      />
+    </label>
+  );
+}
+
+function TextAreaInput({
+  label,
+  onChange,
+  placeholder,
+  value,
+}: {
+  label: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  value: string;
+}) {
+  return (
+    <label className="flex flex-col gap-2 text-sm font-medium text-slate-700 xl:col-span-2">
+      {label}
+      <textarea
+        className="min-h-24 rounded-md border border-slate-300 px-3 py-2 text-base text-slate-950 outline-none transition focus:border-slate-900 focus:ring-2 focus:ring-slate-200"
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
         value={value}
       />
     </label>
@@ -1198,6 +1794,31 @@ async function fetchRecentProspects(runId: string, filters: ProspectFilters) {
   return payload.prospects ?? [];
 }
 
+async function saveSearchRun({
+  keyword,
+  city,
+  state,
+}: {
+  keyword: string;
+  city: string;
+  state: string;
+}) {
+  const response = await fetch("/api/prospects/google-search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ keyword, city, state }),
+  });
+  const payload = (await response.json()) as ProspectsResponse;
+
+  if (!response.ok) {
+    throw new Error(payload.error ?? "Unable to save prospects.");
+  }
+
+  return payload;
+}
+
 async function fetchRuns() {
   const response = await fetch("/api/prospects/runs", {
     method: "GET",
@@ -1210,6 +1831,47 @@ async function fetchRuns() {
   }
 
   return payload.runs ?? [];
+}
+
+function parseBatchCities(input: string, fallbackState: string) {
+  return input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const commaParts = line
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      if (commaParts.length >= 2) {
+        return {
+          city: commaParts[0],
+          state: commaParts[1].toUpperCase(),
+        };
+      }
+
+      const tokens = line.split(/\s+/).filter(Boolean);
+      const possibleState = tokens.at(-1) ?? "";
+
+      if (tokens.length > 1 && /^[A-Za-z]{2}$/.test(possibleState)) {
+        return {
+          city: tokens.slice(0, -1).join(" "),
+          state: possibleState.toUpperCase(),
+        };
+      }
+
+      const state = fallbackState.trim();
+
+      if (!state) {
+        throw new Error(`Batch city "${line}" needs a state.`);
+      }
+
+      return {
+        city: line,
+        state: state.length <= 3 ? state.toUpperCase() : state,
+      };
+    });
 }
 
 function buildProspectQueryParams(runId: string, filters: ProspectFilters) {
@@ -1226,6 +1888,14 @@ function buildProspectQueryParams(runId: string, filters: ProspectFilters) {
   }
 
   return params;
+}
+
+function getMinimumStudentsBody(filters: ProspectFilters) {
+  const minStudents = Number.parseInt(filters.minStudents, 10);
+
+  return Number.isFinite(minStudents) && minStudents > 0
+    ? { minStudents }
+    : {};
 }
 
 function idKey(value: string | number) {

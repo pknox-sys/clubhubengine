@@ -8,6 +8,7 @@ import {
 
 export type ProspectFilters = {
   runId?: string;
+  runIds?: string[];
   prospectIds?: string[];
   city?: string;
   state?: string;
@@ -18,6 +19,7 @@ export type ProspectFilters = {
   contactRank?: number;
   dataConfidence?: string;
   hasEmail?: boolean;
+  minStudents?: number;
 };
 
 export type ProspectRecord = Record<string, unknown> & {
@@ -38,12 +40,17 @@ type LoadOptions = {
 export function parseProspectFilters(searchParams: URLSearchParams) {
   const filters: ProspectFilters = {};
   const runId = getParam(searchParams, "runId");
+  const runIds = getParam(searchParams, "runIds")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
   const prospectIds = getParam(searchParams, "prospectIds")
     .split(",")
     .map((id) => id.trim())
     .filter(Boolean);
 
   if (runId) filters.runId = runId;
+  if (runIds.length > 0) filters.runIds = runIds;
   if (prospectIds.length > 0) filters.prospectIds = prospectIds;
   setStringFilter(filters, "city", searchParams);
   setStringFilter(filters, "state", searchParams);
@@ -68,6 +75,12 @@ export function parseProspectFilters(searchParams: URLSearchParams) {
 
   if (Number.isFinite(contactRank) && contactRank > 0) {
     filters.contactRank = contactRank;
+  }
+
+  const minStudents = Number.parseInt(getParam(searchParams, "minStudents"), 10);
+
+  if (Number.isFinite(minStudents) && minStudents > 0) {
+    filters.minStudents = minStudents;
   }
 
   return filters;
@@ -194,14 +207,21 @@ async function getCandidateProspectIds(
     return filters.prospectIds;
   }
 
-  if (!filters.runId) {
+  const runIds = Array.from(
+    new Set([
+      ...(filters.runIds ?? []),
+      ...(filters.runId ? [filters.runId] : []),
+    ]),
+  );
+
+  if (runIds.length === 0) {
     return null;
   }
 
   const { data, error } = await supabase
     .from("prospect_run_prospects")
     .select("prospect_id")
-    .eq("run_id", filters.runId)
+    .in("run_id", runIds)
     .limit(10_000);
 
   if (error) {
@@ -291,6 +311,14 @@ function doesProspectMatchFilters(
     const hasEmail = hasUsableProspectEmail(prospect);
 
     if (hasEmail !== filters.hasEmail) {
+      return false;
+    }
+  }
+
+  if (filters.minStudents !== undefined) {
+    const studentCount = getProspectStudentCount(prospect);
+
+    if (studentCount === null || studentCount < filters.minStudents) {
       return false;
     }
   }
@@ -389,6 +417,30 @@ function hasUsableProspectEmail(prospect: ProspectRecord) {
     contacts.some((contact) => normalizeEmail(contact.email)) ||
     Boolean(normalizeEmail(prospect.contact_email))
   );
+}
+
+function getProspectStudentCount(prospect: ProspectRecord) {
+  return (
+    numberFromLooseText(prospect.number_of_students) ??
+    numberFromLooseText(prospect.hs_enrollment) ??
+    numberFromLooseText(prospect.total_enrollment)
+  );
+}
+
+function numberFromLooseText(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  const normalized = stringValue(value).replace(/[^0-9.]+/g, "");
+
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(normalized);
+
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function getSortedContacts(contacts: ProspectContactRecord[]) {

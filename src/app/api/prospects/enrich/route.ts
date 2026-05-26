@@ -65,6 +65,7 @@ const enrichRequestSchema = z.object({
   runId: z.string().trim().min(1).optional(),
   runIds: z.array(z.string().trim().min(1)).optional(),
   prospectIds: z.array(z.union([z.string(), z.number()])).optional(),
+  minStudents: z.coerce.number().int().positive().optional(),
 });
 
 type ProspectToEnrich = Record<string, unknown> & {
@@ -147,6 +148,7 @@ type EnrichRequestScope = {
   hasScope: boolean;
   prospectIds: string[];
   runIds: string[];
+  minStudents?: number;
 };
 
 export async function POST(request: Request) {
@@ -320,14 +322,29 @@ function getRequestScope(body: EnrichRequestBody): EnrichRequestScope {
   ]);
 
   if (prospectIds.length > 0) {
-    return { hasScope: true, prospectIds, runIds: [] };
+    return {
+      hasScope: true,
+      prospectIds,
+      runIds: [],
+      minStudents: body.minStudents,
+    };
   }
 
   if (runIds.length > 0) {
-    return { hasScope: true, prospectIds: [], runIds };
+    return {
+      hasScope: true,
+      prospectIds: [],
+      runIds,
+      minStudents: body.minStudents,
+    };
   }
 
-  return { hasScope: false, prospectIds: [], runIds: [] };
+  return {
+    hasScope: false,
+    prospectIds: [],
+    runIds: [],
+    minStudents: body.minStudents,
+  };
 }
 
 async function loadProspectsToEnrich(
@@ -343,11 +360,18 @@ async function loadProspectsToEnrich(
         "enrichment_status.is.null,enrichment_status.eq.raw,enrichment_status.eq.enrichment_failed",
       )
       .order("created_at", { ascending: true });
-    const { data, error } =
-      typeof limit === "number" ? await query.limit(limit) : await query;
+    const { data, error } = scope.minStudents
+      ? await query.limit(10_000)
+      : typeof limit === "number"
+        ? await query.limit(limit)
+        : await query;
+
+    const prospects = ((data ?? []) as ProspectToEnrich[])
+      .filter(Boolean)
+      .filter((prospect) => meetsMinimumStudents(prospect, scope.minStudents));
 
     return {
-      prospects: ((data ?? []) as ProspectToEnrich[]).filter(Boolean),
+      prospects: typeof limit === "number" ? prospects.slice(0, limit) : prospects,
       skipped: [] as ProspectToEnrich[],
       error,
     };
@@ -382,7 +406,9 @@ async function loadProspectsToEnrich(
     };
   }
 
-  const scopedProspects = ((data ?? []) as ProspectToEnrich[]).filter(Boolean);
+  const scopedProspects = ((data ?? []) as ProspectToEnrich[])
+    .filter(Boolean)
+    .filter((prospect) => meetsMinimumStudents(prospect, scope.minStudents));
   const prospects = scopedProspects.filter(isEligibleForEnrichment);
   const skipped = scopedProspects.filter(
     (prospect) => !isEligibleForEnrichment(prospect),
@@ -421,6 +447,22 @@ function isEligibleForEnrichment(prospect: ProspectToEnrich) {
   const status = textValue(prospect.enrichment_status).toLowerCase();
 
   return !status || status === "raw" || status === "enrichment_failed";
+}
+
+function meetsMinimumStudents(
+  prospect: ProspectToEnrich,
+  minStudents: number | undefined,
+) {
+  if (!minStudents) {
+    return true;
+  }
+
+  const studentCount =
+    numberFromLooseText(prospect.number_of_students) ??
+    numberFromLooseText(prospect.hs_enrollment) ??
+    numberFromLooseText(prospect.total_enrollment);
+
+  return studentCount !== null && studentCount >= minStudents;
 }
 
 async function markProspectEnriching(prospect: ProspectToEnrich) {
@@ -1040,6 +1082,22 @@ function numberFromText(value: unknown) {
   }
 
   const parsed = Number.parseInt(normalized, 10);
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function numberFromLooseText(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  const normalized = textValue(value).replace(/[^0-9.]+/g, "");
+
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(normalized);
 
   return Number.isFinite(parsed) ? parsed : null;
 }

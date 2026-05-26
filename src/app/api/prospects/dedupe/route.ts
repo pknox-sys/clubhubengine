@@ -1,3 +1,5 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
+
 import { createSupabaseServerClient, MissingServerEnvError } from "@/lib/supabaseServer";
 
 export const dynamic = "force-dynamic";
@@ -21,6 +23,27 @@ type DuplicateGroup = {
   canonical: ProspectRecord;
   duplicates: ProspectRecord[];
   matchByDuplicateId: Map<string, DuplicateMatch>;
+};
+
+type ProspectContactRecord = Record<string, unknown> & {
+  id: string | number;
+  prospect_id?: string | number | null;
+};
+
+type RunMembershipRecord = {
+  run_id?: string | null;
+  prospect_id?: string | number | null;
+  google_place_id?: string | null;
+};
+
+type GroupResult = {
+  canonical_prospect_id: string | number;
+  canonical_school_name: string;
+  duplicate_ids: Array<string | number>;
+  duplicate_school_names: string[];
+  contacts_moved_or_merged: number;
+  run_memberships_moved_or_merged: number;
+  error?: string;
 };
 
 const SCALAR_MERGE_FIELDS = [
@@ -53,6 +76,42 @@ const SCALAR_MERGE_FIELDS = [
   "bec_status",
   "bec_event",
   "bec_details",
+  "company_domain_name",
+  "company_owner",
+  "street_address",
+  "state_region_code",
+  "postal_code",
+  "time_zone",
+  "industry",
+  "company_type",
+  "record_source",
+  "religion",
+  "school_structure",
+  "school_structure_boy_girl",
+  "school_structure_day_boarding",
+  "school_divisions",
+  "low_grade",
+  "high_grade",
+  "number_of_students",
+  "number_of_clubs",
+  "list_of_clubs",
+  "clubs_letter_grade",
+  "percent_clubs_get_funding",
+  "percent_lots_of_participation",
+  "percent_plenty_of_clubs",
+  "tuition",
+  "niche_ranking",
+  "number_of_employees_range",
+  "annual_revenue",
+  "subscription_year",
+  "description",
+  "linkedin_company_page",
+  "reference_school",
+  "reference_school_reason",
+  "ai_fit_reason",
+  "source_url",
+  "data_confidence",
+  "export_notes",
 ];
 
 const ARRAY_MERGE_FIELDS = ["source_urls", "fields_not_found"];
@@ -75,7 +134,10 @@ export async function POST() {
         duplicate_groups_found: 0,
         duplicates_moved: 0,
         canonical_records_updated: 0,
+        contacts_moved_or_merged: 0,
+        run_memberships_moved_or_merged: 0,
         active_prospects_remaining: 0,
+        per_group_results: [],
         message: "No duplicates found.",
       });
     }
@@ -88,30 +150,79 @@ export async function POST() {
         duplicate_groups_found: 0,
         duplicates_moved: 0,
         canonical_records_updated: 0,
+        contacts_moved_or_merged: 0,
+        run_memberships_moved_or_merged: 0,
         active_prospects_remaining: prospects.length,
+        per_group_results: [],
         message: "No duplicates found.",
       });
     }
 
     let canonicalRecordsUpdated = 0;
+    let contactsMovedOrMerged = 0;
+    let runMembershipsMovedOrMerged = 0;
+    const groupResults: GroupResult[] = [];
 
     for (const group of groups) {
+      const groupResult: GroupResult = {
+        canonical_prospect_id: group.canonical.id,
+        canonical_school_name: stringValue(group.canonical.school_name),
+        duplicate_ids: group.duplicates.map((duplicate) => duplicate.id),
+        duplicate_school_names: group.duplicates.map((duplicate) =>
+          stringValue(duplicate.school_name),
+        ),
+        contacts_moved_or_merged: 0,
+        run_memberships_moved_or_merged: 0,
+      };
       const merged = buildCanonicalMerge(group.canonical, group.duplicates);
 
-      if (Object.keys(merged).length === 0) {
-        continue;
+      if (Object.keys(merged).length > 0) {
+        const { error: updateError } = await supabase
+          .from("prospects")
+          .update(merged)
+          .eq("id", group.canonical.id);
+
+        if (updateError) {
+          return jsonError("Canonical update failure.", 500);
+        }
+
+        canonicalRecordsUpdated += 1;
       }
 
-      const { error: updateError } = await supabase
-        .from("prospects")
-        .update(merged)
-        .eq("id", group.canonical.id);
+      try {
+        const relationshipResult = await preserveDuplicateRelationships(
+          supabase,
+          group,
+        );
 
-      if (updateError) {
-        return jsonError("Canonical update failure.", 500);
+        groupResult.contacts_moved_or_merged =
+          relationshipResult.contactsMovedOrMerged;
+        groupResult.run_memberships_moved_or_merged =
+          relationshipResult.runMembershipsMovedOrMerged;
+        contactsMovedOrMerged += relationshipResult.contactsMovedOrMerged;
+        runMembershipsMovedOrMerged +=
+          relationshipResult.runMembershipsMovedOrMerged;
+      } catch (relationshipError) {
+        groupResult.error = getErrorMessage(relationshipError);
+        groupResults.push(groupResult);
+
+        return Response.json(
+          {
+            error: "Duplicate relationship preservation failure.",
+            total_checked: prospects.length,
+            duplicate_groups_found: groups.length,
+            duplicates_moved: 0,
+            canonical_records_updated: canonicalRecordsUpdated,
+            contacts_moved_or_merged: contactsMovedOrMerged,
+            run_memberships_moved_or_merged: runMembershipsMovedOrMerged,
+            active_prospects_remaining: prospects.length,
+            per_group_results: groupResults,
+          },
+          { status: 500 },
+        );
       }
 
-      canonicalRecordsUpdated += 1;
+      groupResults.push(groupResult);
     }
 
     const now = new Date().toISOString();
@@ -145,6 +256,15 @@ export async function POST() {
       return jsonError("Duplicate archive insert failure.", 500);
     }
 
+    const { error: deleteRunMembershipsError } = await supabase
+      .from("prospect_run_prospects")
+      .delete()
+      .in("prospect_id", duplicateIds);
+
+    if (deleteRunMembershipsError) {
+      return jsonError("Duplicate run membership delete failure.", 500);
+    }
+
     const { error: deleteError } = await supabase
       .from("prospects")
       .delete()
@@ -161,8 +281,11 @@ export async function POST() {
       duplicate_groups_found: groups.length,
       duplicates_moved: duplicateIds.length,
       canonical_records_updated: canonicalRecordsUpdated,
+      contacts_moved_or_merged: contactsMovedOrMerged,
+      run_memberships_moved_or_merged: runMembershipsMovedOrMerged,
       active_prospects_remaining: activeProspectsRemaining,
-      message: `Moved ${duplicateIds.length} duplicates into prospects_duplicates. ${activeProspectsRemaining} active prospects remain.`,
+      per_group_results: groupResults,
+      message: `Moved ${duplicateIds.length} duplicates into prospects_duplicates. Merged ${contactsMovedOrMerged} contacts and ${runMembershipsMovedOrMerged} run memberships. ${activeProspectsRemaining} active prospects remain.`,
     });
   } catch (error) {
     if (error instanceof MissingServerEnvError) {
@@ -170,6 +293,197 @@ export async function POST() {
     }
 
     return jsonError("Unexpected server error.", 500);
+  }
+}
+
+async function preserveDuplicateRelationships(
+  supabase: SupabaseClient,
+  group: DuplicateGroup,
+) {
+  let contactsMovedOrMerged = 0;
+  let runMembershipsMovedOrMerged = 0;
+
+  for (const duplicate of group.duplicates) {
+    contactsMovedOrMerged += await moveOrMergeDuplicateContacts(
+      supabase,
+      group.canonical.id,
+      duplicate.id,
+    );
+    runMembershipsMovedOrMerged += await moveOrMergeRunMemberships(
+      supabase,
+      group.canonical.id,
+      duplicate.id,
+    );
+  }
+
+  await recomputeCanonicalContactRanks(supabase, group.canonical.id);
+
+  return { contactsMovedOrMerged, runMembershipsMovedOrMerged };
+}
+
+async function moveOrMergeDuplicateContacts(
+  supabase: SupabaseClient,
+  canonicalProspectId: string | number,
+  duplicateProspectId: string | number,
+) {
+  const { data: canonicalContacts, error: canonicalError } = await supabase
+    .from("prospect_contacts")
+    .select("*")
+    .eq("prospect_id", canonicalProspectId)
+    .limit(10_000);
+
+  if (canonicalError) {
+    throw new Error("Unable to load canonical contacts.");
+  }
+
+  const { data: duplicateContacts, error: duplicateError } = await supabase
+    .from("prospect_contacts")
+    .select("*")
+    .eq("prospect_id", duplicateProspectId)
+    .limit(10_000);
+
+  if (duplicateError) {
+    throw new Error("Unable to load duplicate contacts.");
+  }
+
+  const canonicalByKey = new Map<string, ProspectContactRecord>();
+
+  for (const contact of (canonicalContacts ?? []) as ProspectContactRecord[]) {
+    const key = getContactDedupeKey(contact);
+
+    if (key) {
+      canonicalByKey.set(key, contact);
+    }
+  }
+
+  let movedOrMerged = 0;
+
+  for (const duplicateContact of (duplicateContacts ?? []) as ProspectContactRecord[]) {
+    const key = getContactDedupeKey(duplicateContact);
+    const canonicalContact = key ? canonicalByKey.get(key) : null;
+
+    if (canonicalContact) {
+      const merged = buildContactMerge(canonicalContact, duplicateContact);
+
+      if (Object.keys(merged).length > 0) {
+        const { error: mergeError } = await supabase
+          .from("prospect_contacts")
+          .update(merged)
+          .eq("id", canonicalContact.id);
+
+        if (mergeError) {
+          throw new Error("Unable to merge duplicate contact.");
+        }
+      }
+
+      const { error: deleteError } = await supabase
+        .from("prospect_contacts")
+        .delete()
+        .eq("id", duplicateContact.id);
+
+      if (deleteError) {
+        throw new Error("Unable to remove merged duplicate contact.");
+      }
+
+      movedOrMerged += 1;
+      continue;
+    }
+
+    const { error: moveError } = await supabase
+      .from("prospect_contacts")
+      .update({ prospect_id: canonicalProspectId })
+      .eq("id", duplicateContact.id);
+
+    if (moveError) {
+      throw new Error("Unable to move duplicate contact.");
+    }
+
+    if (key) {
+      canonicalByKey.set(key, {
+        ...duplicateContact,
+        prospect_id: canonicalProspectId,
+      });
+    }
+
+    movedOrMerged += 1;
+  }
+
+  return movedOrMerged;
+}
+
+async function moveOrMergeRunMemberships(
+  supabase: SupabaseClient,
+  canonicalProspectId: string | number,
+  duplicateProspectId: string | number,
+) {
+  const { data: memberships, error } = await supabase
+    .from("prospect_run_prospects")
+    .select("run_id, prospect_id, google_place_id")
+    .eq("prospect_id", duplicateProspectId)
+    .limit(10_000);
+
+  if (error) {
+    throw new Error("Unable to load duplicate run memberships.");
+  }
+
+  let movedOrMerged = 0;
+
+  for (const membership of (memberships ?? []) as RunMembershipRecord[]) {
+    if (!membership.run_id) {
+      continue;
+    }
+
+    const { error: upsertError } = await supabase
+      .from("prospect_run_prospects")
+      .upsert(
+        {
+          run_id: membership.run_id,
+          prospect_id: canonicalProspectId,
+          google_place_id: membership.google_place_id ?? null,
+        },
+        { onConflict: "run_id,prospect_id" },
+      );
+
+    if (upsertError) {
+      throw new Error("Unable to move duplicate run membership.");
+    }
+
+    movedOrMerged += 1;
+  }
+
+  return movedOrMerged;
+}
+
+async function recomputeCanonicalContactRanks(
+  supabase: SupabaseClient,
+  canonicalProspectId: string | number,
+) {
+  const { data, error } = await supabase
+    .from("prospect_contacts")
+    .select("*")
+    .eq("prospect_id", canonicalProspectId)
+    .order("contact_rank", { ascending: true })
+    .order("created_at", { ascending: true })
+    .limit(10_000);
+
+  if (error) {
+    throw new Error("Unable to load canonical contacts for rank repair.");
+  }
+
+  const contacts = ((data ?? []) as ProspectContactRecord[]).sort(compareContactsForRank);
+
+  for (const [index, contact] of contacts.entries()) {
+    const { error: updateError } = await supabase
+      .from("prospect_contacts")
+      .update({
+        contact_rank: index + 1,
+        sequence_pick: index === 0,
+      })
+      .eq("id", contact.id);
+
+    if (updateError) {
+      throw new Error("Unable to repair canonical contact ranks.");
+    }
   }
 }
 
@@ -357,6 +671,101 @@ function buildCanonicalMerge(
   return merged;
 }
 
+function buildContactMerge(
+  canonical: ProspectContactRecord,
+  duplicate: ProspectContactRecord,
+) {
+  const merged: Record<string, unknown> = {};
+  const fillFields = [
+    "first_name",
+    "last_name",
+    "email",
+    "phone_number",
+    "job_title",
+    "contact_owner",
+    "lead_status",
+    "sequence_name",
+    "best_contact_reason",
+    "contact_source_url",
+    "contact_confidence",
+  ];
+
+  for (const field of fillFields) {
+    if (!isBlank(canonical[field])) {
+      continue;
+    }
+
+    if (!isBlank(duplicate[field])) {
+      merged[field] = duplicate[field];
+    }
+  }
+
+  const betterStatus = getBetterValidationStatus(
+    canonical.email_validation_status,
+    duplicate.email_validation_status,
+  );
+
+  if (
+    betterStatus &&
+    normalizeValidationStatus(betterStatus) !==
+      normalizeValidationStatus(canonical.email_validation_status)
+  ) {
+    merged.email_validation_status = betterStatus;
+  }
+
+  const mergedNotes = mergeNotes(canonical.notes, duplicate.notes);
+
+  if (mergedNotes && mergedNotes !== stringValue(canonical.notes)) {
+    merged.notes = mergedNotes;
+  }
+
+  return merged;
+}
+
+function getContactDedupeKey(contact: ProspectContactRecord) {
+  const email = normalizeEmail(contact.email);
+
+  if (email) {
+    return `email:${email}`;
+  }
+
+  const nameTitle = [
+    normalizeText(contact.first_name),
+    normalizeText(contact.last_name),
+    normalizeText(contact.job_title),
+  ]
+    .filter(Boolean)
+    .join("|");
+
+  return nameTitle ? `name-title:${nameTitle}` : "";
+}
+
+function compareContactsForRank(
+  left: ProspectContactRecord,
+  right: ProspectContactRecord,
+) {
+  if (Boolean(left.sequence_pick) !== Boolean(right.sequence_pick)) {
+    return left.sequence_pick ? -1 : 1;
+  }
+
+  const rankDifference =
+    numberValue(left.contact_rank) - numberValue(right.contact_rank);
+
+  if (rankDifference !== 0) {
+    return rankDifference;
+  }
+
+  const emailDifference =
+    Number(Boolean(normalizeEmail(right.email))) -
+    Number(Boolean(normalizeEmail(left.email)));
+
+  if (emailDifference !== 0) {
+    return emailDifference;
+  }
+
+  return getTimestamp(left.created_at) - getTimestamp(right.created_at);
+}
+
 function getStrongestMatchForDuplicate(
   duplicate: ProspectRecord,
   groupRows: ProspectRecord[],
@@ -399,6 +808,12 @@ function normalizePhone(value: unknown) {
   }
 
   return digits.length >= 7 ? digits : "";
+}
+
+function normalizeEmail(value: unknown) {
+  return stringValue(value)
+    .toLowerCase()
+    .match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? "";
 }
 
 function getDomain(value: unknown) {
@@ -482,6 +897,37 @@ function uniqueStrings(values: string[]) {
   return Array.from(new Set(values));
 }
 
+function mergeNotes(left: unknown, right: unknown) {
+  return uniqueStrings([stringValue(left), stringValue(right)].filter(Boolean)).join(
+    " ",
+  );
+}
+
+function getBetterValidationStatus(left: unknown, right: unknown) {
+  const leftStatus = stringValue(left);
+  const rightStatus = stringValue(right);
+
+  return getValidationStatusPriority(rightStatus) >
+    getValidationStatusPriority(leftStatus)
+    ? rightStatus
+    : leftStatus;
+}
+
+function getValidationStatusPriority(value: unknown) {
+  const normalized = normalizeValidationStatus(value);
+
+  if (normalized === "valid") return 4;
+  if (normalized === "invalid") return 3;
+  if (normalized === "error") return 2;
+  if (normalized === "unknown") return 1;
+
+  return 0;
+}
+
+function normalizeValidationStatus(value: unknown) {
+  return stringValue(value).toLowerCase();
+}
+
 function isBlank(value: unknown) {
   if (value === null || value === undefined) return true;
   if (typeof value === "string") return value.trim() === "";
@@ -491,6 +937,16 @@ function isBlank(value: unknown) {
 
 function stringValue(value: unknown) {
   return typeof value === "string" ? value : "";
+}
+
+function numberValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  const parsed = Number.parseInt(stringValue(value), 10);
+
+  return Number.isFinite(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
 }
 
 function getTimestamp(value: unknown) {
@@ -509,6 +965,10 @@ function pairKey(left: string | number, right: string | number) {
 
 function jsonError(message: string, status: number) {
   return Response.json({ error: message }, { status });
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Unknown error.";
 }
 
 class UnionFind {
