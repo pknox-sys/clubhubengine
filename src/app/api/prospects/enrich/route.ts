@@ -37,6 +37,8 @@ const DEFAULT_LEAD_STATUS = "New";
 const DEFAULT_RECORD_SOURCE = "Import";
 const DEFAULT_INDUSTRY = "Education Management";
 const DEFAULT_SEQUENCE_NAME = "Club Hub - V1 School Outreach";
+const SUPABASE_PAGE_SIZE = 1_000;
+const SUPABASE_IN_CHUNK_SIZE = 100;
 const PATTERN_INFERRED_NOTE =
   "Email pattern inferred from public staff emails; needs validation.";
 const EMAIL_NOT_FOUND_NOTE =
@@ -396,13 +398,7 @@ async function loadProspectsToEnrich(
     };
   }
 
-  const query = supabase
-    .from("prospects")
-    .select("*")
-    .in("id", scopedProspectIds)
-    .order("created_at", { ascending: true });
-  const { data, error } =
-    typeof limit === "number" ? await query.limit(limit) : await query;
+  const { data, error } = await loadProspectsByIds(supabase, scopedProspectIds);
 
   if (error) {
     return {
@@ -412,7 +408,7 @@ async function loadProspectsToEnrich(
     };
   }
 
-  const scopedProspects = ((data ?? []) as ProspectToEnrich[])
+  const scopedProspects = data
     .filter(Boolean)
     .filter((prospect) => meetsMinimumStudents(prospect, scope.minStudents));
   const prospects = scopedProspects.filter(isEligibleForEnrichment);
@@ -420,7 +416,11 @@ async function loadProspectsToEnrich(
     (prospect) => !isEligibleForEnrichment(prospect),
   );
 
-  return { prospects, skipped, error: null };
+  return {
+    prospects: typeof limit === "number" ? prospects.slice(0, limit) : prospects,
+    skipped,
+    error: null,
+  };
 }
 
 async function getProspectIdsForRuns(
@@ -431,22 +431,58 @@ async function getProspectIdsForRuns(
     return [];
   }
 
-  const { data, error } = await supabase
-    .from("prospect_run_prospects")
-    .select("prospect_id")
-    .in("run_id", runIds)
-    .limit(10_000);
+  const rows: Array<{ prospect_id?: string | number | null }> = [];
 
-  if (error) {
-    throw new ProspectEnrichmentError("Supabase query failure.");
+  for (const runIdChunk of chunkArray(runIds, SUPABASE_IN_CHUNK_SIZE)) {
+    const { data, error } = await fetchAllRows<{
+      prospect_id?: string | number | null;
+    }>((from, to) =>
+      supabase
+        .from("prospect_run_prospects")
+        .select("prospect_id")
+        .in("run_id", runIdChunk)
+        .range(from, to),
+    );
+
+    if (error) {
+      throw new ProspectEnrichmentError("Supabase query failure.");
+    }
+
+    rows.push(...data);
   }
 
   return uniqueStrings(
-    (data ?? [])
+    rows
       .map((row: { prospect_id?: string | number | null }) => row.prospect_id)
       .filter((id): id is string | number => id !== null && id !== undefined)
       .map((id) => String(id)),
   );
+}
+
+async function loadProspectsByIds(
+  supabase: SupabaseClient,
+  prospectIds: string[],
+) {
+  const prospects: ProspectToEnrich[] = [];
+
+  for (const idChunk of chunkArray(prospectIds, SUPABASE_IN_CHUNK_SIZE)) {
+    const { data, error } = await fetchAllRows<ProspectToEnrich>((from, to) =>
+      supabase
+        .from("prospects")
+        .select("*")
+        .in("id", idChunk)
+        .order("created_at", { ascending: true })
+        .range(from, to),
+    );
+
+    if (error) {
+      return { data: [] as ProspectToEnrich[], error };
+    }
+
+    prospects.push(...data);
+  }
+
+  return { data: prospects, error: null };
 }
 
 function isEligibleForEnrichment(prospect: ProspectToEnrich) {
@@ -1390,6 +1426,41 @@ function arrayStrings(value: unknown) {
 
 function uniqueStrings(values: string[]) {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+async function fetchAllRows<T>(
+  fetchPage: (
+    from: number,
+    to: number,
+  ) => PromiseLike<{ data: unknown[] | null; error: unknown | null }>,
+) {
+  const rows: T[] = [];
+
+  for (let from = 0; ; from += SUPABASE_PAGE_SIZE) {
+    const to = from + SUPABASE_PAGE_SIZE - 1;
+    const { data, error } = await fetchPage(from, to);
+
+    if (error) {
+      return { data: [] as T[], error };
+    }
+
+    const page = (data ?? []) as T[];
+    rows.push(...page);
+
+    if (page.length < SUPABASE_PAGE_SIZE) {
+      return { data: rows, error: null };
+    }
+  }
+}
+
+function chunkArray<T>(values: T[], size: number) {
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+
+  return chunks;
 }
 
 function firstString(values: string[]) {

@@ -76,6 +76,7 @@ type CandidateLoadResult = {
   targets: ValidationTarget[];
   skippedResults: ValidationResultItem[];
   scope: string;
+  remainingValidatable: number;
 };
 
 const requestSchema = z.object({
@@ -85,6 +86,9 @@ const requestSchema = z.object({
   runIds: z.array(z.string().trim().min(1)).optional(),
   retryErrors: z.boolean().optional(),
   minStudents: z.coerce.number().int().positive().optional(),
+  excludeContactIds: z.array(z.union([z.string(), z.number()])).optional(),
+  excludeLegacyProspectIds: z.array(z.union([z.string(), z.number()])).optional(),
+  includeSkipped: z.boolean().optional(),
 });
 
 const BAD_EMAIL_VALUES = new Set([
@@ -109,6 +113,8 @@ const VALIDATABLE_STATUSES = new Set([
 ]);
 
 const FINAL_STATUSES = new Set(["valid", "invalid"]);
+const SUPABASE_PAGE_SIZE = 1_000;
+const SUPABASE_IN_CHUNK_SIZE = 100;
 
 export async function POST(request: Request) {
   try {
@@ -121,17 +127,20 @@ export async function POST(request: Request) {
     const body = parsedBody.data;
     const limit = clampLimit(body.limit ?? 50);
     const supabase = createSupabaseServerClient();
-    const { targets, skippedResults, scope } = await loadValidationTargets(
-      supabase,
-      {
+    const { targets, skippedResults, scope, remainingValidatable } =
+      await loadValidationTargets(supabase, {
         limit,
         prospectIds: body.prospectIds?.map((id) => String(id)) ?? [],
         runId: body.runId?.trim() ?? "",
         runIds: body.runIds ?? [],
         retryErrors: body.retryErrors ?? false,
         minStudents: body.minStudents,
-      },
-    );
+        excludeContactIds:
+          body.excludeContactIds?.map((id) => String(id)) ?? [],
+        excludeLegacyProspectIds:
+          body.excludeLegacyProspectIds?.map((id) => String(id)) ?? [],
+        includeSkipped: body.includeSkipped ?? true,
+      });
 
     const summary: ValidationSummary = {
       checked: 0,
@@ -170,6 +179,7 @@ export async function POST(request: Request) {
     return Response.json({
       ...summary,
       scope,
+      remaining_validatable: remainingValidatable,
       reranked_prospects: rerankResult.reranked,
       rerank_errors: rerankResult.errors,
       results,
@@ -197,6 +207,9 @@ async function loadValidationTargets(
     runIds: string[];
     retryErrors: boolean;
     minStudents?: number;
+    excludeContactIds: string[];
+    excludeLegacyProspectIds: string[];
+    includeSkipped: boolean;
   },
 ): Promise<CandidateLoadResult> {
   const scopedProspectIds = await resolveScopedProspectIds(supabase, options);
@@ -206,7 +219,7 @@ async function loadValidationTargets(
   const scope = getScopeLabel(options, scopedProspectIds);
 
   if (scopedProspectIds && scopedProspectIds.length === 0) {
-    return { targets: [], skippedResults: [], scope };
+    return { targets: [], skippedResults: [], scope, remainingValidatable: 0 };
   }
 
   const contacts = await loadContacts(supabase, scopedProspectIds);
@@ -248,6 +261,9 @@ async function loadValidationTargets(
 
   const targets: ValidationTarget[] = [];
   const skippedResults: ValidationResultItem[] = [];
+  const excludedContactIds = new Set(options.excludeContactIds);
+  const excludedLegacyProspectIds = new Set(options.excludeLegacyProspectIds);
+  let validatableCount = 0;
 
   for (const contact of filteredContacts) {
     const prospectId = String(contact.prospect_id ?? "");
@@ -258,7 +274,7 @@ async function loadValidationTargets(
     const currentStatus = normalizeStatus(contact.email_validation_status);
 
     if (!email) {
-      if (isScoped) {
+      if (isScoped && options.includeSkipped) {
         skippedResults.push({
           target_type: "contact",
           prospect_id: prospectId,
@@ -276,7 +292,7 @@ async function loadValidationTargets(
     }
 
     if (!shouldValidateStatus(currentStatus, options.retryErrors)) {
-      if (isScoped) {
+      if (isScoped && options.includeSkipped) {
         skippedResults.push({
           target_type: "contact",
           prospect_id: prospectId,
@@ -292,6 +308,12 @@ async function loadValidationTargets(
 
       continue;
     }
+
+    if (excludedContactIds.has(String(contact.id))) {
+      continue;
+    }
+
+    validatableCount += 1;
 
     if (targets.length < options.limit) {
       targets.push({
@@ -320,7 +342,7 @@ async function loadValidationTargets(
     );
 
     if (!email) {
-      if (isScoped) {
+      if (isScoped && options.includeSkipped) {
         skippedResults.push({
           target_type: "legacy",
           prospect_id: prospect.id,
@@ -337,7 +359,7 @@ async function loadValidationTargets(
     }
 
     if (!shouldValidateStatus(currentStatus, options.retryErrors)) {
-      if (isScoped) {
+      if (isScoped && options.includeSkipped) {
         skippedResults.push({
           target_type: "legacy",
           prospect_id: prospect.id,
@@ -353,6 +375,12 @@ async function loadValidationTargets(
       continue;
     }
 
+    if (excludedLegacyProspectIds.has(prospectId)) {
+      continue;
+    }
+
+    validatableCount += 1;
+
     if (targets.length < options.limit) {
       targets.push({
         target_type: "legacy",
@@ -366,7 +394,12 @@ async function loadValidationTargets(
     }
   }
 
-  return { targets, skippedResults, scope };
+  return {
+    targets,
+    skippedResults,
+    scope,
+    remainingValidatable: Math.max(0, validatableCount - targets.length),
+  };
 }
 
 async function resolveScopedProspectIds(
@@ -390,18 +423,28 @@ async function resolveScopedProspectIds(
     return null;
   }
 
-  const { data, error } = await supabase
-    .from("prospect_run_prospects")
-    .select("prospect_id")
-    .in("run_id", runIds)
-    .limit(10_000);
+  const rows: Array<{ prospect_id?: string | number | null }> = [];
 
-  if (error) {
-    throw new Error("Unable to load run prospect membership.");
+  for (const runIdChunk of chunkArray(runIds, SUPABASE_IN_CHUNK_SIZE)) {
+    const { data, error } = await fetchAllRows<{
+      prospect_id?: string | number | null;
+    }>((from, to) =>
+      supabase
+        .from("prospect_run_prospects")
+        .select("prospect_id")
+        .in("run_id", runIdChunk)
+        .range(from, to),
+    );
+
+    if (error) {
+      throw new Error("Unable to load run prospect membership.");
+    }
+
+    rows.push(...data);
   }
 
   return uniqueStrings(
-    (data ?? [])
+    rows
       .map((row: { prospect_id?: string | number | null }) => row.prospect_id)
       .filter((id): id is string | number => id !== null && id !== undefined)
       .map((id) => String(id)),
@@ -412,7 +455,7 @@ async function loadContacts(
   supabase: SupabaseClient,
   scopedProspectIds: string[] | null,
 ) {
-  let query = supabase
+  const query = supabase
     .from("prospect_contacts")
     .select("*")
     .order("contact_rank", { ascending: true })
@@ -423,7 +466,28 @@ async function loadContacts(
       return [] as ProspectContactRecord[];
     }
 
-    query = query.in("prospect_id", scopedProspectIds);
+    const contacts: ProspectContactRecord[] = [];
+
+    for (const idChunk of chunkArray(scopedProspectIds, SUPABASE_IN_CHUNK_SIZE)) {
+      const { data, error } = await fetchAllRows<ProspectContactRecord>(
+        (from, to) =>
+          supabase
+            .from("prospect_contacts")
+            .select("*")
+            .in("prospect_id", idChunk)
+            .order("contact_rank", { ascending: true })
+            .order("created_at", { ascending: true })
+            .range(from, to),
+      );
+
+      if (error) {
+        throw new Error("Unable to load prospect contacts.");
+      }
+
+      contacts.push(...data);
+    }
+
+    return contacts;
   }
 
   const { data, error } = await query.limit(10_000);
@@ -445,34 +509,20 @@ async function loadProspectsForValidation(
       return [] as ProspectRecord[];
     }
 
-    const { data, error } = await supabase
-      .from("prospects")
-      .select("*")
-      .in("id", scopedProspectIds)
-      .limit(10_000);
-
-    if (error) {
-      throw new Error("Unable to load scoped prospects.");
-    }
-
-    return (data ?? []) as ProspectRecord[];
+    return loadProspectsByIds(supabase, scopedProspectIds, "scoped prospects");
   }
 
   const contactIds = uniqueStrings(contactProspectIds);
   const prospectsById = new Map<string, ProspectRecord>();
 
   if (contactIds.length > 0) {
-    const { data, error } = await supabase
-      .from("prospects")
-      .select("*")
-      .in("id", contactIds)
-      .limit(10_000);
+    const contactProspects = await loadProspectsByIds(
+      supabase,
+      contactIds,
+      "contact prospects",
+    );
 
-    if (error) {
-      throw new Error("Unable to load contact prospects.");
-    }
-
-    for (const prospect of (data ?? []) as ProspectRecord[]) {
+    for (const prospect of contactProspects) {
       prospectsById.set(String(prospect.id), prospect);
     }
   }
@@ -494,6 +544,32 @@ async function loadProspectsForValidation(
   }
 
   return Array.from(prospectsById.values());
+}
+
+async function loadProspectsByIds(
+  supabase: SupabaseClient,
+  prospectIds: string[],
+  label: string,
+) {
+  const prospects: ProspectRecord[] = [];
+
+  for (const idChunk of chunkArray(prospectIds, SUPABASE_IN_CHUNK_SIZE)) {
+    const { data, error } = await fetchAllRows<ProspectRecord>((from, to) =>
+      supabase
+        .from("prospects")
+        .select("*")
+        .in("id", idChunk)
+        .range(from, to),
+    );
+
+    if (error) {
+      throw new Error(`Unable to load ${label}.`);
+    }
+
+    prospects.push(...data);
+  }
+
+  return prospects;
 }
 
 async function validateTargetEmail(
@@ -585,21 +661,30 @@ async function rerankContactsForProspects(
     return { reranked: 0, errors: [] as string[] };
   }
 
-  const { data, error } = await supabase
-    .from("prospect_contacts")
-    .select("*")
-    .in("prospect_id", uniqueProspectIds)
-    .order("contact_rank", { ascending: true })
-    .order("created_at", { ascending: true })
-    .limit(10_000);
+  const contacts: ProspectContactRecord[] = [];
 
-  if (error) {
-    return { reranked: 0, errors: ["Unable to load contacts for rerank."] };
+  for (const idChunk of chunkArray(uniqueProspectIds, SUPABASE_IN_CHUNK_SIZE)) {
+    const { data, error } = await fetchAllRows<ProspectContactRecord>(
+      (from, to) =>
+        supabase
+          .from("prospect_contacts")
+          .select("*")
+          .in("prospect_id", idChunk)
+          .order("contact_rank", { ascending: true })
+          .order("created_at", { ascending: true })
+          .range(from, to),
+    );
+
+    if (error) {
+      return { reranked: 0, errors: ["Unable to load contacts for rerank."] };
+    }
+
+    contacts.push(...data);
   }
 
   const contactsByProspectId = new Map<string, ProspectContactRecord[]>();
 
-  for (const contact of (data ?? []) as ProspectContactRecord[]) {
+  for (const contact of contacts) {
     const prospectId = String(contact.prospect_id ?? "");
 
     if (!prospectId) {
@@ -1058,6 +1143,41 @@ function nullableString(value: unknown) {
 
 function uniqueStrings(values: string[]) {
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+async function fetchAllRows<T>(
+  fetchPage: (
+    from: number,
+    to: number,
+  ) => PromiseLike<{ data: unknown[] | null; error: unknown | null }>,
+) {
+  const rows: T[] = [];
+
+  for (let from = 0; ; from += SUPABASE_PAGE_SIZE) {
+    const to = from + SUPABASE_PAGE_SIZE - 1;
+    const { data, error } = await fetchPage(from, to);
+
+    if (error) {
+      return { data: [] as T[], error };
+    }
+
+    const page = (data ?? []) as T[];
+    rows.push(...page);
+
+    if (page.length < SUPABASE_PAGE_SIZE) {
+      return { data: rows, error: null };
+    }
+  }
+}
+
+function chunkArray<T>(values: T[], size: number) {
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+
+  return chunks;
 }
 
 function getSafeError(result: BecResult) {

@@ -19,6 +19,7 @@ import type { ProspectInsertRow, ProspectListItem } from "@/types/prospect";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 const PROSPECT_SELECT_FIELDS = `
   id,
@@ -64,7 +65,7 @@ export async function GET(request: Request) {
     const { prospects, error } = await loadProspectsForFilters(supabase, filters);
 
     if (error) {
-      return jsonError("Supabase save failure while loading prospects.", 500);
+      return jsonError(getLoadErrorMessage(error), 500);
     }
 
     return Response.json({
@@ -294,6 +295,15 @@ function handleRouteError(error: unknown) {
 
 function jsonError(message: string, status: number) {
   return Response.json({ error: message }, { status });
+}
+
+function getLoadErrorMessage(error: unknown) {
+  const stage =
+    typeof error === "object" && error && "stage" in error
+      ? String((error as { stage?: unknown }).stage)
+      : "prospects";
+
+  return `Supabase read failure while loading ${stage}.`;
 }
 
 function formatRunTimestamp(date: Date) {

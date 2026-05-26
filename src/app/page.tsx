@@ -143,6 +143,7 @@ type ValidationResponse = ActionResponse & {
   unknown?: number;
   errors?: number;
   skipped?: number;
+  remaining_validatable?: number;
   scope?: string;
   results?: ValidationResultItem[];
 };
@@ -177,6 +178,7 @@ type ProspectFilters = {
   dataConfidence: string;
   hasEmail: string;
   minStudents: string;
+  highGrade: string;
   companyDomain: string;
   exportReadiness: string;
 };
@@ -195,6 +197,7 @@ const EMPTY_FILTERS: ProspectFilters = {
   dataConfidence: "",
   hasEmail: "",
   minStudents: "",
+  highGrade: "",
   companyDomain: "",
   exportReadiness: "",
 };
@@ -565,7 +568,7 @@ export default function Home() {
   }
 
   async function handleValidateSelectedRows() {
-    await runEmailValidation(
+    await runScopedEmailValidation(
       { prospectIds: Array.from(selectedProspectIds) },
       `${selectedProspectIds.size} selected rows`,
     );
@@ -574,14 +577,14 @@ export default function Home() {
   async function handleValidateSelectedRuns() {
     const runIds = Array.from(selectedRunIds);
 
-    await runEmailValidation(
+    await runScopedEmailValidation(
       { runIds, ...getMinimumStudentsBody(filters) },
       `${runIds.length} selected runs`,
     );
   }
 
   async function handleValidateLoadedRows() {
-    await runEmailValidation(
+    await runScopedEmailValidation(
       { prospectIds: prospects.map((prospect) => idKey(prospect.id)) },
       `${prospects.length} loaded / filtered rows`,
     );
@@ -649,6 +652,116 @@ export default function Home() {
     }
   }
 
+  async function runScopedEmailValidation(
+    body: Record<string, unknown>,
+    scope: string,
+  ) {
+    setIsEmailValidationRunning(true);
+    setMessage("");
+    setError("");
+
+    const aggregate = {
+      checked: 0,
+      valid: 0,
+      invalid: 0,
+      unknown: 0,
+      errors: 0,
+      skipped: 0,
+      results: [] as ValidationResultItem[],
+    };
+    const excludeContactIds = new Set<string>();
+    const excludeLegacyProspectIds = new Set<string>();
+    const maxBatches = 100;
+
+    setValidationPanel({
+      scope,
+      message: "Email validation is running...",
+      ...aggregate,
+    });
+
+    try {
+      let batches = 0;
+      let remaining = 1;
+
+      while (remaining > 0 && batches < maxBatches) {
+        batches += 1;
+        const response = await fetch("/api/prospects/validate-emails", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            limit: 50,
+            ...body,
+            excludeContactIds: Array.from(excludeContactIds),
+            excludeLegacyProspectIds: Array.from(excludeLegacyProspectIds),
+            includeSkipped: batches === 1,
+          }),
+        });
+        const payload = (await response.json()) as ValidationResponse;
+
+        if (!response.ok) {
+          throw new Error(payload.error ?? "Unable to validate emails.");
+        }
+
+        for (const result of payload.results ?? []) {
+          if (result.target_type === "contact" && result.contact_id) {
+            excludeContactIds.add(String(result.contact_id));
+          }
+
+          if (result.target_type === "legacy" && result.prospect_id) {
+            excludeLegacyProspectIds.add(String(result.prospect_id));
+          }
+        }
+
+        aggregate.checked += payload.checked ?? 0;
+        aggregate.valid += payload.valid ?? 0;
+        aggregate.invalid += payload.invalid ?? 0;
+        aggregate.unknown += payload.unknown ?? 0;
+        aggregate.errors += payload.errors ?? 0;
+        aggregate.skipped += payload.skipped ?? 0;
+        aggregate.results = [
+          ...aggregate.results,
+          ...(payload.results ?? []),
+        ];
+        remaining = payload.remaining_validatable ?? 0;
+
+        setValidationPanel({
+          scope: payload.scope ?? scope,
+          message: `Batch ${batches}: checked ${payload.checked ?? 0}. Total checked ${aggregate.checked}. ${remaining} remaining.`,
+          ...aggregate,
+        });
+
+        if ((payload.checked ?? 0) === 0 || remaining === 0) {
+          break;
+        }
+      }
+
+      await loadProspects();
+      const finalMessage = `Checked ${aggregate.checked} emails across ${batches} batches for ${scope}. Valid: ${aggregate.valid}. Invalid: ${aggregate.invalid}. Unknown: ${aggregate.unknown}. Errors: ${aggregate.errors}. Skipped: ${aggregate.skipped}.`;
+
+      setValidationPanel({
+        scope,
+        message: finalMessage,
+        ...aggregate,
+      });
+      setMessage(finalMessage);
+    } catch (validationError) {
+      setError(getReadableError(validationError));
+      setValidationPanel((current) =>
+        current
+          ? {
+              ...current,
+              message: getReadableError(validationError),
+              errors: current.errors || 1,
+            }
+          : current,
+      );
+    } finally {
+      setIsEmailValidationRunning(false);
+    }
+  }
+
   async function handleFixContactRanks() {
     const prospectIds =
       selectedProspectIds.size > 0
@@ -682,13 +795,38 @@ export default function Home() {
     }
   }
 
-  function handleDownloadHubSpotCsv() {
-    const params =
-      selectedProspectIds.size > 0
-        ? new URLSearchParams({
-            prospectIds: Array.from(selectedProspectIds).join(","),
-          })
-        : buildProspectQueryParams(Array.from(selectedRunIds), filters);
+  async function handleDownloadHubSpotCsv() {
+    if (selectedProspectIds.size > 0) {
+      setError("");
+
+      try {
+        const response = await fetch("/api/prospects/export-hubspot", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            prospectIds: Array.from(selectedProspectIds),
+          }),
+        });
+
+        if (!response.ok) {
+          const payload = (await response.json().catch(() => null)) as
+            | { error?: string }
+            | null;
+
+          throw new Error(payload?.error ?? "Unable to download HubSpot CSV.");
+        }
+
+        downloadBlob(await response.blob(), "club-hub-hubspot-upload.csv");
+      } catch (downloadError) {
+        setError(getReadableError(downloadError));
+      }
+
+      return;
+    }
+
+    const params = buildProspectQueryParams(Array.from(selectedRunIds), filters);
     const query = params.toString();
 
     window.location.href = `/api/prospects/export-hubspot${query ? `?${query}` : ""}`;
@@ -959,6 +1097,12 @@ export default function Home() {
               onChange={(value) => handleFilterChange("minStudents", value)}
               type="number"
               value={filters.minStudents}
+            />
+            <TextInput
+              label="High Grade"
+              onChange={(value) => handleFilterChange("highGrade", value)}
+              type="number"
+              value={filters.highGrade}
             />
           </div>
 
@@ -1748,6 +1892,18 @@ function TableCell({
 
 function getReadableError(error: unknown) {
   return error instanceof Error ? error.message : "Something went wrong.";
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 function formatBestContact(prospect: ProspectListItem) {
