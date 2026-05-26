@@ -65,6 +65,7 @@ const enrichRequestSchema = z.object({
   runId: z.string().trim().min(1).optional(),
   runIds: z.array(z.string().trim().min(1)).optional(),
   prospectIds: z.array(z.union([z.string(), z.number()])).optional(),
+  minStudents: z.coerce.number().int().positive().optional(),
 });
 
 type ProspectToEnrich = Record<string, unknown> & {
@@ -127,6 +128,12 @@ type ContactWriteRow = {
   notes: string | null;
 };
 
+type ContactWriteCandidate = ContactWriteRow & {
+  emailSource: "public_source" | "pattern_inferred" | "";
+  modelRank: number;
+  sequenceScore: number;
+};
+
 class MissingOpenAIEnvError extends Error {
   constructor() {
     super("Missing OPENAI_API_KEY");
@@ -147,6 +154,7 @@ type EnrichRequestScope = {
   hasScope: boolean;
   prospectIds: string[];
   runIds: string[];
+  minStudents?: number;
 };
 
 export async function POST(request: Request) {
@@ -320,14 +328,29 @@ function getRequestScope(body: EnrichRequestBody): EnrichRequestScope {
   ]);
 
   if (prospectIds.length > 0) {
-    return { hasScope: true, prospectIds, runIds: [] };
+    return {
+      hasScope: true,
+      prospectIds,
+      runIds: [],
+      minStudents: body.minStudents,
+    };
   }
 
   if (runIds.length > 0) {
-    return { hasScope: true, prospectIds: [], runIds };
+    return {
+      hasScope: true,
+      prospectIds: [],
+      runIds,
+      minStudents: body.minStudents,
+    };
   }
 
-  return { hasScope: false, prospectIds: [], runIds: [] };
+  return {
+    hasScope: false,
+    prospectIds: [],
+    runIds: [],
+    minStudents: body.minStudents,
+  };
 }
 
 async function loadProspectsToEnrich(
@@ -343,11 +366,18 @@ async function loadProspectsToEnrich(
         "enrichment_status.is.null,enrichment_status.eq.raw,enrichment_status.eq.enrichment_failed",
       )
       .order("created_at", { ascending: true });
-    const { data, error } =
-      typeof limit === "number" ? await query.limit(limit) : await query;
+    const { data, error } = scope.minStudents
+      ? await query.limit(10_000)
+      : typeof limit === "number"
+        ? await query.limit(limit)
+        : await query;
+
+    const prospects = ((data ?? []) as ProspectToEnrich[])
+      .filter(Boolean)
+      .filter((prospect) => meetsMinimumStudents(prospect, scope.minStudents));
 
     return {
-      prospects: ((data ?? []) as ProspectToEnrich[]).filter(Boolean),
+      prospects: typeof limit === "number" ? prospects.slice(0, limit) : prospects,
       skipped: [] as ProspectToEnrich[],
       error,
     };
@@ -382,7 +412,9 @@ async function loadProspectsToEnrich(
     };
   }
 
-  const scopedProspects = ((data ?? []) as ProspectToEnrich[]).filter(Boolean);
+  const scopedProspects = ((data ?? []) as ProspectToEnrich[])
+    .filter(Boolean)
+    .filter((prospect) => meetsMinimumStudents(prospect, scope.minStudents));
   const prospects = scopedProspects.filter(isEligibleForEnrichment);
   const skipped = scopedProspects.filter(
     (prospect) => !isEligibleForEnrichment(prospect),
@@ -421,6 +453,22 @@ function isEligibleForEnrichment(prospect: ProspectToEnrich) {
   const status = textValue(prospect.enrichment_status).toLowerCase();
 
   return !status || status === "raw" || status === "enrichment_failed";
+}
+
+function meetsMinimumStudents(
+  prospect: ProspectToEnrich,
+  minStudents: number | undefined,
+) {
+  if (!minStudents) {
+    return true;
+  }
+
+  const studentCount =
+    numberFromLooseText(prospect.number_of_students) ??
+    numberFromLooseText(prospect.hs_enrollment) ??
+    numberFromLooseText(prospect.total_enrollment);
+
+  return studentCount !== null && studentCount >= minStudents;
 }
 
 async function markProspectEnriching(prospect: ProspectToEnrich) {
@@ -767,7 +815,7 @@ function buildContactRows(
   contacts: EnrichmentContact[],
   prospect: ProspectToEnrich,
 ) {
-  const rows: ContactWriteRow[] = [];
+  const rows: ContactWriteCandidate[] = [];
   let contactsDropped = 0;
 
   for (const contact of contacts) {
@@ -780,9 +828,9 @@ function buildContactRows(
     }
   }
 
-  const sortedRows = rows.sort((left, right) => left.contact_rank - right.contact_rank);
+  const sortedRows = rows.sort(compareContactCandidates);
   const seenKeys = new Set<string>();
-  const uniqueRows: ContactWriteRow[] = [];
+  const uniqueRows: ContactWriteCandidate[] = [];
 
   for (const row of sortedRows) {
     const dedupeKey = contactDedupeKey(row);
@@ -798,11 +846,7 @@ function buildContactRows(
 
   const rowsWithFallback =
     uniqueRows.length > 0 ? uniqueRows : [buildFallbackContactRow(prospect)];
-  const finalRows = rowsWithFallback.map((row, index) => ({
-    ...row,
-    contact_rank: index + 1,
-    sequence_pick: index === 0,
-  }));
+  const finalRows = rowsWithFallback.map(finalizeContactRank);
 
   return {
     rows: finalRows,
@@ -816,7 +860,7 @@ function buildContactRows(
 function buildContactRow(
   contact: EnrichmentContact,
   prospect: ProspectToEnrich,
-): ContactWriteRow | null {
+): ContactWriteCandidate | null {
   const normalizedEmail = normalizeEmail(contact.email);
   const hasConsumerEmail = Boolean(
     normalizedEmail && isConsumerEmail(normalizedEmail),
@@ -839,16 +883,19 @@ function buildContactRow(
     return null;
   }
 
-  const isPatternInferred = contact.email_source === "pattern_inferred";
+  const emailSource = normalizeEmailSource(contact.email_source);
+  const isPatternInferred = emailSource === "pattern_inferred";
   const notes = buildContactNotes({
     notes: textValue(contact.notes),
     isPatternInferred,
     hasConsumerEmail,
     hasEmail: Boolean(email),
+    emailPatternDomain: textValue(contact.email_pattern_domain),
+    emailPatternExample: textValue(contact.email_pattern_example),
+    emailPatternEvidence: textValue(contact.email_pattern_evidence),
   });
   const contactConfidence = normalizeConfidence(contact.contact_confidence);
-
-  return {
+  const row: ContactWriteCandidate = {
     first_name: firstName || null,
     last_name: lastName || null,
     email,
@@ -872,7 +919,189 @@ function buildContactRow(
       ? "Medium"
       : contactConfidence || null,
     notes: notes || null,
+    emailSource,
+    modelRank: positiveInteger(contact.contact_rank) ?? Number.MAX_SAFE_INTEGER,
+    sequenceScore: 0,
   };
+
+  row.sequenceScore = scoreContactCandidate(row);
+
+  return row;
+}
+
+function compareContactCandidates(
+  left: ContactWriteCandidate,
+  right: ContactWriteCandidate,
+) {
+  const scoreDifference = right.sequenceScore - left.sequenceScore;
+
+  if (scoreDifference !== 0) {
+    return scoreDifference;
+  }
+
+  const rankDifference = left.modelRank - right.modelRank;
+
+  if (rankDifference !== 0) {
+    return rankDifference;
+  }
+
+  return normalizeKey(getContactName(left)).localeCompare(
+    normalizeKey(getContactName(right)),
+  );
+}
+
+function finalizeContactRank(
+  row: ContactWriteRow | ContactWriteCandidate,
+  index: number,
+): ContactWriteRow {
+  return {
+    first_name: row.first_name,
+    last_name: row.last_name,
+    email: row.email,
+    phone_number: row.phone_number,
+    job_title: row.job_title,
+    contact_owner: row.contact_owner,
+    lead_status: row.lead_status,
+    contact_rank: index + 1,
+    sequence_pick: index === 0,
+    sequence_name: row.sequence_name,
+    best_contact_reason: row.best_contact_reason,
+    email_validation_status: row.email_validation_status,
+    contact_source_url: row.contact_source_url,
+    contact_confidence: row.contact_confidence,
+    notes: row.notes,
+  };
+}
+
+function scoreContactCandidate(contact: ContactWriteCandidate) {
+  const roleScore = getRoleFitScore(contact);
+  const isReasonableIcp = roleScore >= 45;
+  let emailScore = 0;
+
+  if (contact.email && contact.emailSource === "public_source") {
+    emailScore = isReasonableIcp ? 85 : 45;
+  } else if (contact.email && contact.emailSource === "pattern_inferred") {
+    emailScore = isReasonableIcp ? 55 : 25;
+  } else if (contact.email) {
+    emailScore = isReasonableIcp ? 70 : 35;
+  }
+
+  const sourceScore = contact.contact_source_url ? 10 : 0;
+  const nameScore = contact.first_name || contact.last_name ? 8 : 0;
+  const confidenceScore =
+    contact.contact_confidence === "High"
+      ? 6
+      : contact.contact_confidence === "Medium"
+        ? 3
+        : 0;
+
+  return roleScore + emailScore + sourceScore + nameScore + confidenceScore;
+}
+
+function getRoleFitScore(contact: ContactWriteRow) {
+  const roleText = normalizeKey(
+    [
+      contact.job_title,
+      contact.best_contact_reason,
+      contact.notes,
+    ]
+      .map(textValue)
+      .join(" "),
+  );
+
+  if (!roleText) {
+    return 0;
+  }
+
+  if (
+    includesAny(roleText, [
+      "director of student life",
+      "director student life",
+      "director of student activities",
+      "director student activities",
+      "director of clubs",
+      "director clubs",
+      "student life director",
+      "student activities director",
+    ])
+  ) {
+    return 95;
+  }
+
+  if (
+    includesAny(roleText, [
+      "student life",
+      "student activities",
+      "activities coordinator",
+      "activity coordinator",
+      "student government",
+      "club advisor",
+      "clubs",
+      "student organizations",
+      "student organisation",
+    ])
+  ) {
+    return 88;
+  }
+
+  if (
+    includesAny(roleText, [
+      "dean of students",
+      "upper school dean",
+      "dean students",
+      "student dean",
+    ])
+  ) {
+    return 82;
+  }
+
+  if (
+    includesAny(roleText, [
+      "principal",
+      "head of school",
+      "head of upper school",
+      "assistant head",
+      "assistant principal",
+      "associate principal",
+    ])
+  ) {
+    return 72;
+  }
+
+  if (
+    includesAny(roleText, [
+      "athletic director",
+      "athletics director",
+      "director of athletics",
+      "activities director",
+      "activity director",
+    ])
+  ) {
+    return 64;
+  }
+
+  if (
+    includesAny(roleText, [
+      "counselor",
+      "operations",
+      "technology",
+      "administrator",
+      "administration",
+      "assistant dean",
+    ])
+  ) {
+    return 48;
+  }
+
+  if (contact.job_title || contact.first_name || contact.last_name) {
+    return 25;
+  }
+
+  return 10;
+}
+
+function includesAny(value: string, needles: string[]) {
+  return needles.some((needle) => value.includes(needle));
 }
 
 function buildFallbackContactRow(prospect: ProspectToEnrich): ContactWriteRow {
@@ -932,15 +1161,30 @@ function buildContactNotes({
   isPatternInferred,
   hasConsumerEmail,
   hasEmail,
+  emailPatternDomain,
+  emailPatternExample,
+  emailPatternEvidence,
 }: {
   notes: string;
   isPatternInferred: boolean;
   hasConsumerEmail: boolean;
   hasEmail: boolean;
+  emailPatternDomain: string;
+  emailPatternExample: string;
+  emailPatternEvidence: string;
 }) {
+  const patternEvidence = [
+    emailPatternDomain ? `domain ${emailPatternDomain}` : "",
+    emailPatternExample ? `example ${emailPatternExample}` : "",
+    emailPatternEvidence,
+  ]
+    .filter(Boolean)
+    .join("; ");
+
   return uniqueStrings([
     notes,
     isPatternInferred ? PATTERN_INFERRED_NOTE : "",
+    patternEvidence ? `Email pattern evidence: ${patternEvidence}.` : "",
     hasConsumerEmail ? CONSUMER_EMAIL_EXCLUDED_NOTE : "",
     hasEmail ? "" : EMAIL_NOT_FOUND_NOTE,
   ]).join(" ");
@@ -1044,6 +1288,22 @@ function numberFromText(value: unknown) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function numberFromLooseText(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  const normalized = textValue(value).replace(/[^0-9.]+/g, "");
+
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(normalized);
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function positiveInteger(value: unknown) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) {
     return null;
@@ -1090,6 +1350,16 @@ function normalizeAiEmailStatus(value: unknown): "Valid" | "Unknown" | "Error" {
   }
 
   return "Unknown";
+}
+
+function normalizeEmailSource(value: unknown) {
+  const text = textValue(value);
+
+  if (text === "public_source" || text === "pattern_inferred") {
+    return text;
+  }
+
+  return "";
 }
 
 function normalizeExistingEmailStatus(value: unknown) {

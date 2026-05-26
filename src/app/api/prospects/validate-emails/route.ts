@@ -1,15 +1,35 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 
 import { createSupabaseServerClient, MissingServerEnvError } from "@/lib/supabaseServer";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 type ProspectRecord = Record<string, unknown> & {
   id: string | number;
+  school_name?: string | null;
+  contact_name?: string | null;
   contact_email?: string | null;
+  email_validation_status?: string | null;
+  contact_email_validation_status?: string | null;
   email_validation_attempts?: number | null;
+};
+
+type ProspectContactRecord = Record<string, unknown> & {
+  id: string | number;
+  prospect_id?: string | number | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  email?: string | null;
+  phone_number?: string | null;
+  job_title?: string | null;
+  contact_rank?: number | null;
+  sequence_pick?: boolean | null;
+  contact_source_url?: string | null;
+  email_validation_status?: string | null;
+  created_at?: string | null;
 };
 
 type BecResult = {
@@ -19,17 +39,52 @@ type BecResult = {
   raw: unknown;
 };
 
+type ValidationTarget = {
+  target_type: "contact" | "legacy";
+  prospect_id: string | number;
+  contact_id?: string | number;
+  school_name: string;
+  contact_name: string;
+  email: string;
+  current_status: string;
+  prospect?: ProspectRecord;
+};
+
+type ValidationResultItem = {
+  target_type: "contact" | "legacy";
+  prospect_id: string | number;
+  contact_id?: string | number;
+  school_name: string;
+  contact_name: string;
+  email: string;
+  status: "Valid" | "Invalid" | "Unknown" | "Error" | "Skipped";
+  event?: string | null;
+  details?: string | null;
+  error?: string | null;
+};
+
 type ValidationSummary = {
   checked: number;
   valid: number;
-  invalid_moved: number;
+  invalid: number;
   unknown: number;
   errors: number;
   skipped: number;
 };
 
+type CandidateLoadResult = {
+  targets: ValidationTarget[];
+  skippedResults: ValidationResultItem[];
+  scope: string;
+};
+
 const requestSchema = z.object({
   limit: z.coerce.number().int().optional(),
+  prospectIds: z.array(z.union([z.string(), z.number()])).optional(),
+  runId: z.string().trim().optional(),
+  runIds: z.array(z.string().trim().min(1)).optional(),
+  retryErrors: z.boolean().optional(),
+  minStudents: z.coerce.number().int().positive().optional(),
 });
 
 const BAD_EMAIL_VALUES = new Set([
@@ -43,20 +98,17 @@ const BAD_EMAIL_VALUES = new Set([
   "invalid",
 ]);
 
-const ALLOWED_CONTACT_VALIDATION_STATUSES = new Set([
+const VALIDATABLE_STATUSES = new Set([
   "",
+  "not_checked",
   "public source",
   "public_source_unverified",
   "unknown",
-]);
-
-const FINAL_EMAIL_VALIDATION_STATUSES = new Set([
-  "valid",
-  "unknown",
-  "invalid",
-  "skipped_no_email",
+  "error",
   "checking",
 ]);
+
+const FINAL_STATUSES = new Set(["valid", "invalid"]);
 
 export async function POST(request: Request) {
   try {
@@ -66,57 +118,62 @@ export async function POST(request: Request) {
       return jsonError("Invalid request body.", 400);
     }
 
-    const limit = clampLimit(parsedBody.data.limit ?? 50);
+    const body = parsedBody.data;
+    const limit = clampLimit(body.limit ?? 50);
     const supabase = createSupabaseServerClient();
-    const { data, error } = await supabase
-      .from("prospects")
-      .select("*")
-      .not("contact_email", "is", null)
-      .neq("contact_email", "")
-      .or(
-        "email_validation_status.is.null,email_validation_status.eq.not_checked,email_validation_status.eq.public_source_unverified,email_validation_status.eq.error",
-      )
-      .order("created_at", { ascending: true })
-      .limit(limit);
-
-    if (error) {
-      return jsonError("Supabase select failure.", 500);
-    }
-
-    const prospects = ((data ?? []) as ProspectRecord[]).filter(shouldValidateRow);
-
-    if (prospects.length === 0) {
-      return Response.json({
-        checked: 0,
-        valid: 0,
-        invalid_moved: 0,
-        unknown: 0,
-        errors: 0,
-        skipped: 0,
-        message: "No emails need validation.",
-      });
-    }
+    const { targets, skippedResults, scope } = await loadValidationTargets(
+      supabase,
+      {
+        limit,
+        prospectIds: body.prospectIds?.map((id) => String(id)) ?? [],
+        runId: body.runId?.trim() ?? "",
+        runIds: body.runIds ?? [],
+        retryErrors: body.retryErrors ?? false,
+        minStudents: body.minStudents,
+      },
+    );
 
     const summary: ValidationSummary = {
       checked: 0,
       valid: 0,
-      invalid_moved: 0,
+      invalid: 0,
       unknown: 0,
       errors: 0,
-      skipped: 0,
+      skipped: skippedResults.length,
     };
+    const results: ValidationResultItem[] = [...skippedResults];
+    const affectedProspectIds = new Set<string>(
+      skippedResults.map((result) => String(result.prospect_id)),
+    );
 
-    for (const [index, prospect] of prospects.entries()) {
-      await validateProspectEmail(prospect, summary);
+    for (const [index, target] of targets.entries()) {
+      const result = await validateTargetEmail(supabase, target);
+      results.push(result);
+      affectedProspectIds.add(String(result.prospect_id));
 
-      if (index < prospects.length - 1) {
+      if (result.status === "Valid") summary.valid += 1;
+      if (result.status === "Invalid") summary.invalid += 1;
+      if (result.status === "Unknown") summary.unknown += 1;
+      if (result.status === "Error") summary.errors += 1;
+      if (result.status === "Skipped") summary.skipped += 1;
+      if (result.status !== "Skipped") summary.checked += 1;
+
+      if (index < targets.length - 1) {
         await delay(300);
       }
     }
+    const rerankResult = await rerankContactsForProspects(
+      supabase,
+      Array.from(affectedProspectIds),
+    );
 
     return Response.json({
       ...summary,
-      message: `Checked ${summary.checked} emails. Valid kept: ${summary.valid}. Invalid moved: ${summary.invalid_moved}. Unknown kept: ${summary.unknown}. Errors kept: ${summary.errors}.`,
+      scope,
+      reranked_prospects: rerankResult.reranked,
+      rerank_errors: rerankResult.errors,
+      results,
+      message: `Checked ${summary.checked} emails for ${scope}. Valid: ${summary.valid}. Invalid: ${summary.invalid}. Unknown: ${summary.unknown}. Errors: ${summary.errors}. Skipped: ${summary.skipped}.`,
     });
   } catch (error) {
     if (error instanceof MissingServerEnvError) {
@@ -131,182 +188,665 @@ export async function POST(request: Request) {
   }
 }
 
-async function validateProspectEmail(
-  prospect: ProspectRecord,
-  summary: ValidationSummary,
-) {
-  const supabase = createSupabaseServerClient();
-  const normalizedEmail = extractEmail(prospect.contact_email);
-  const attempts = (numberValue(prospect.email_validation_attempts) ?? 0) + 1;
-  const checkedAt = new Date().toISOString();
+async function loadValidationTargets(
+  supabase: SupabaseClient,
+  options: {
+    limit: number;
+    prospectIds: string[];
+    runId: string;
+    runIds: string[];
+    retryErrors: boolean;
+    minStudents?: number;
+  },
+): Promise<CandidateLoadResult> {
+  const scopedProspectIds = await resolveScopedProspectIds(supabase, options);
+  const isScoped = Boolean(
+    options.prospectIds.length > 0 || options.runId || options.runIds.length > 0,
+  );
+  const scope = getScopeLabel(options, scopedProspectIds);
 
-  if (!normalizedEmail) {
-    const { error } = await supabase
-      .from("prospects")
-      .update({
-        email_validation_status: "skipped_no_email",
-        contact_email_validation_status: "Skipped - No Email",
-        email_validation_checked_at: checkedAt,
-        email_validation_attempts: attempts,
-      })
-      .eq("id", prospect.id);
+  if (scopedProspectIds && scopedProspectIds.length === 0) {
+    return { targets: [], skippedResults: [], scope };
+  }
 
-    if (error) {
-      summary.errors += 1;
-      return;
+  const contacts = await loadContacts(supabase, scopedProspectIds);
+  const prospectIdsFromContacts = contacts
+    .map((contact) => contact.prospect_id)
+    .filter((id): id is string | number => id !== null && id !== undefined)
+    .map((id) => String(id));
+  const prospects = await loadProspectsForValidation(
+    supabase,
+    scopedProspectIds,
+    prospectIdsFromContacts,
+  );
+  const filteredProspects = prospects.filter((prospect) =>
+    meetsMinimumStudents(prospect, options.minStudents),
+  );
+  const allowedProspectIds = new Set(
+    filteredProspects.map((prospect) => String(prospect.id)),
+  );
+  const filteredContacts = contacts.filter((contact) =>
+    allowedProspectIds.has(String(contact.prospect_id ?? "")),
+  );
+  const prospectsById = new Map(
+    filteredProspects.map((prospect) => [String(prospect.id), prospect]),
+  );
+  const contactCountsByProspectId = new Map<string, number>();
+
+  for (const contact of filteredContacts) {
+    const prospectId = String(contact.prospect_id ?? "");
+
+    if (!prospectId) {
+      continue;
     }
 
-    summary.skipped += 1;
-    return;
+    contactCountsByProspectId.set(
+      prospectId,
+      (contactCountsByProspectId.get(prospectId) ?? 0) + 1,
+    );
   }
 
-  summary.checked += 1;
+  const targets: ValidationTarget[] = [];
+  const skippedResults: ValidationResultItem[] = [];
 
-  const { error: checkingError } = await supabase
-    .from("prospects")
-    .update({
-      email_validation_status: "checking",
-      email_validation_error: null,
-      email_validation_attempts: attempts,
-    })
-    .eq("id", prospect.id);
+  for (const contact of filteredContacts) {
+    const prospectId = String(contact.prospect_id ?? "");
+    const prospect = prospectsById.get(prospectId);
+    const schoolName = stringValue(prospect?.school_name);
+    const contactName = getContactName(contact);
+    const email = extractEmail(contact.email);
+    const currentStatus = normalizeStatus(contact.email_validation_status);
 
-  if (checkingError) {
-    summary.errors += 1;
-    return;
+    if (!email) {
+      if (isScoped) {
+        skippedResults.push({
+          target_type: "contact",
+          prospect_id: prospectId,
+          contact_id: contact.id,
+          school_name: schoolName,
+          contact_name: contactName,
+          email: "",
+          status: "Skipped",
+          event: "no_email",
+          details: "Contact has no email to validate.",
+        });
+      }
+
+      continue;
+    }
+
+    if (!shouldValidateStatus(currentStatus, options.retryErrors)) {
+      if (isScoped) {
+        skippedResults.push({
+          target_type: "contact",
+          prospect_id: prospectId,
+          contact_id: contact.id,
+          school_name: schoolName,
+          contact_name: contactName,
+          email,
+          status: "Skipped",
+          event: "status_final",
+          details: `Current status is ${currentStatus || "blank"}.`,
+        });
+      }
+
+      continue;
+    }
+
+    if (targets.length < options.limit) {
+      targets.push({
+        target_type: "contact",
+        prospect_id: prospectId,
+        contact_id: contact.id,
+        school_name: schoolName,
+        contact_name: contactName,
+        email,
+        current_status: currentStatus,
+      });
+    }
   }
 
-  const result = await checkEmailWithBulkEmailChecker(normalizedEmail);
-  const status = result.status.toLowerCase();
+  for (const prospect of filteredProspects) {
+    const prospectId = String(prospect.id);
 
-  if (status === "passed") {
-    const updated = await updateProspectValidation(prospect.id, {
-      email_validation_status: "valid",
-      contact_email_validation_status: "Valid",
-      email_validation_checked_at: checkedAt,
-      email_validation_provider: "bulk_email_checker",
-      email_validation_checked_email: normalizedEmail,
-      bec_status: result.status,
-      bec_event: result.event,
-      bec_details: result.details,
-      bec_raw_json: result.raw,
-      email_validation_error: null,
-    });
+    if (contactCountsByProspectId.has(prospectId)) {
+      continue;
+    }
 
-    summary[updated ? "valid" : "errors"] += 1;
-    return;
-  }
-
-  if (status === "failed") {
-    const moved = await archiveAndDeleteInvalidEmail(
-      prospect,
-      normalizedEmail,
-      result,
-      checkedAt,
+    const email = extractEmail(prospect.contact_email);
+    const currentStatus = normalizeStatus(
+      prospect.email_validation_status ||
+        prospect.contact_email_validation_status,
     );
 
-    summary[moved ? "invalid_moved" : "errors"] += 1;
-    return;
+    if (!email) {
+      if (isScoped) {
+        skippedResults.push({
+          target_type: "legacy",
+          prospect_id: prospect.id,
+          school_name: stringValue(prospect.school_name),
+          contact_name: stringValue(prospect.contact_name),
+          email: "",
+          status: "Skipped",
+          event: "no_email",
+          details: "Legacy prospect has no email to validate.",
+        });
+      }
+
+      continue;
+    }
+
+    if (!shouldValidateStatus(currentStatus, options.retryErrors)) {
+      if (isScoped) {
+        skippedResults.push({
+          target_type: "legacy",
+          prospect_id: prospect.id,
+          school_name: stringValue(prospect.school_name),
+          contact_name: stringValue(prospect.contact_name),
+          email,
+          status: "Skipped",
+          event: "status_final",
+          details: `Current status is ${currentStatus || "blank"}.`,
+        });
+      }
+
+      continue;
+    }
+
+    if (targets.length < options.limit) {
+      targets.push({
+        target_type: "legacy",
+        prospect_id: prospect.id,
+        school_name: stringValue(prospect.school_name),
+        contact_name: stringValue(prospect.contact_name),
+        email,
+        current_status: currentStatus,
+        prospect,
+      });
+    }
   }
 
-  if (status === "unknown") {
-    const updated = await updateProspectValidation(prospect.id, {
-      email_validation_status: "unknown",
-      contact_email_validation_status: result.event
-        ? `Unknown - ${result.event}`
-        : "Unknown",
-      email_validation_checked_at: checkedAt,
-      email_validation_provider: "bulk_email_checker",
-      email_validation_checked_email: normalizedEmail,
-      bec_status: result.status,
-      bec_event: result.event,
-      bec_details: result.details,
-      bec_raw_json: result.raw,
-      email_validation_error: null,
-    });
-
-    summary[updated ? "unknown" : "errors"] += 1;
-    return;
-  }
-
-  await updateProspectValidation(prospect.id, {
-    email_validation_status: "error",
-    contact_email_validation_status: "Error",
-    email_validation_checked_at: checkedAt,
-    email_validation_provider: "bulk_email_checker",
-    email_validation_checked_email: normalizedEmail,
-    bec_status: "error",
-    bec_event: result.event,
-    bec_details: result.details,
-    bec_raw_json: result.raw,
-    email_validation_error: getSafeError(result),
-  });
-
-  summary.errors += 1;
+  return { targets, skippedResults, scope };
 }
 
-async function archiveAndDeleteInvalidEmail(
-  prospect: ProspectRecord,
-  normalizedEmail: string,
+async function resolveScopedProspectIds(
+  supabase: SupabaseClient,
+  options: {
+    prospectIds: string[];
+    runId: string;
+    runIds: string[];
+  },
+) {
+  if (options.prospectIds.length > 0) {
+    return uniqueStrings(options.prospectIds);
+  }
+
+  const runIds = uniqueStrings([
+    ...options.runIds,
+    ...(options.runId ? [options.runId] : []),
+  ]);
+
+  if (runIds.length === 0) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from("prospect_run_prospects")
+    .select("prospect_id")
+    .in("run_id", runIds)
+    .limit(10_000);
+
+  if (error) {
+    throw new Error("Unable to load run prospect membership.");
+  }
+
+  return uniqueStrings(
+    (data ?? [])
+      .map((row: { prospect_id?: string | number | null }) => row.prospect_id)
+      .filter((id): id is string | number => id !== null && id !== undefined)
+      .map((id) => String(id)),
+  );
+}
+
+async function loadContacts(
+  supabase: SupabaseClient,
+  scopedProspectIds: string[] | null,
+) {
+  let query = supabase
+    .from("prospect_contacts")
+    .select("*")
+    .order("contact_rank", { ascending: true })
+    .order("created_at", { ascending: true });
+
+  if (scopedProspectIds) {
+    if (scopedProspectIds.length === 0) {
+      return [] as ProspectContactRecord[];
+    }
+
+    query = query.in("prospect_id", scopedProspectIds);
+  }
+
+  const { data, error } = await query.limit(10_000);
+
+  if (error) {
+    throw new Error("Unable to load prospect contacts.");
+  }
+
+  return (data ?? []) as ProspectContactRecord[];
+}
+
+async function loadProspectsForValidation(
+  supabase: SupabaseClient,
+  scopedProspectIds: string[] | null,
+  contactProspectIds: string[],
+) {
+  if (scopedProspectIds) {
+    if (scopedProspectIds.length === 0) {
+      return [] as ProspectRecord[];
+    }
+
+    const { data, error } = await supabase
+      .from("prospects")
+      .select("*")
+      .in("id", scopedProspectIds)
+      .limit(10_000);
+
+    if (error) {
+      throw new Error("Unable to load scoped prospects.");
+    }
+
+    return (data ?? []) as ProspectRecord[];
+  }
+
+  const contactIds = uniqueStrings(contactProspectIds);
+  const prospectsById = new Map<string, ProspectRecord>();
+
+  if (contactIds.length > 0) {
+    const { data, error } = await supabase
+      .from("prospects")
+      .select("*")
+      .in("id", contactIds)
+      .limit(10_000);
+
+    if (error) {
+      throw new Error("Unable to load contact prospects.");
+    }
+
+    for (const prospect of (data ?? []) as ProspectRecord[]) {
+      prospectsById.set(String(prospect.id), prospect);
+    }
+  }
+
+  const { data: legacyProspects, error: legacyError } = await supabase
+    .from("prospects")
+    .select("*")
+    .not("contact_email", "is", null)
+    .neq("contact_email", "")
+    .order("created_at", { ascending: true })
+    .limit(1_000);
+
+  if (legacyError) {
+    throw new Error("Unable to load legacy prospects.");
+  }
+
+  for (const prospect of (legacyProspects ?? []) as ProspectRecord[]) {
+    prospectsById.set(String(prospect.id), prospect);
+  }
+
+  return Array.from(prospectsById.values());
+}
+
+async function validateTargetEmail(
+  supabase: SupabaseClient,
+  target: ValidationTarget,
+): Promise<ValidationResultItem> {
+  const result = await checkEmailWithBulkEmailChecker(target.email);
+  const mappedStatus = mapBecStatus(result.status);
+  const checkedAt = new Date().toISOString();
+  const updateOk =
+    target.target_type === "contact"
+      ? await updateContactValidation(supabase, target, mappedStatus)
+      : await updateLegacyProspectValidation(
+          supabase,
+          target,
+          mappedStatus,
+          result,
+          checkedAt,
+        );
+
+  return {
+    target_type: target.target_type,
+    prospect_id: target.prospect_id,
+    contact_id: target.contact_id,
+    school_name: target.school_name,
+    contact_name: target.contact_name,
+    email: target.email,
+    status: updateOk ? mappedStatus : "Error",
+    event: result.event,
+    details: result.details,
+    error: updateOk ? null : "Supabase validation update failed.",
+  };
+}
+
+async function updateContactValidation(
+  supabase: SupabaseClient,
+  target: ValidationTarget,
+  status: "Valid" | "Invalid" | "Unknown" | "Error",
+) {
+  if (!target.contact_id) {
+    return false;
+  }
+
+  const { error } = await supabase
+    .from("prospect_contacts")
+    .update({ email_validation_status: status })
+    .eq("id", target.contact_id);
+
+  return !error;
+}
+
+async function updateLegacyProspectValidation(
+  supabase: SupabaseClient,
+  target: ValidationTarget,
+  status: "Valid" | "Invalid" | "Unknown" | "Error",
   result: BecResult,
   checkedAt: string,
 ) {
-  const supabase = createSupabaseServerClient();
-  const archiveRow = {
-    ...prospect,
-    original_prospect_id: prospect.id,
-    checked_email: normalizedEmail,
-    bec_status_archived: result.status,
-    bec_event_archived: result.event,
-    bec_details_archived: result.details,
-    bec_raw_json_archived: result.raw,
-    moved_to_invalid_emails_at: checkedAt,
-    email_validation_status: "invalid",
-    contact_email_validation_status: "Invalid",
-    email_validation_checked_at: checkedAt,
-    email_validation_provider: "bulk_email_checker",
-    email_validation_checked_email: normalizedEmail,
-    bec_status: result.status,
-    bec_event: result.event,
-    bec_details: result.details,
-    bec_raw_json: result.raw,
-    email_validation_error: null,
-  };
-  const { error: archiveError } = await supabase
-    .from("prospects_invalid_emails")
-    .upsert(archiveRow, { onConflict: "original_prospect_id" });
-
-  if (archiveError) {
-    await updateProspectValidation(prospect.id, {
-      email_validation_status: "error",
-      email_validation_error: "Failed to archive invalid email before delete.",
-    });
-    return false;
-  }
-
-  const { error: deleteError } = await supabase
+  const attempts =
+    (numberValue(target.prospect?.email_validation_attempts) ?? 0) + 1;
+  const { error } = await supabase
     .from("prospects")
-    .delete()
-    .eq("id", prospect.id);
+    .update({
+      email_validation_status: status,
+      contact_email_validation_status: status,
+      email_validation_checked_at: checkedAt,
+      email_validation_provider: "bulk_email_checker",
+      email_validation_checked_email: target.email,
+      email_validation_attempts: attempts,
+      bec_status: result.status,
+      bec_event: result.event,
+      bec_details: result.details,
+      bec_raw_json: result.raw,
+      email_validation_error:
+        status === "Error" ? getSafeError(result) : null,
+    })
+    .eq("id", target.prospect_id);
 
-  if (deleteError) {
-    await updateProspectValidation(prospect.id, {
-      email_validation_status: "error",
-      email_validation_error: "Failed to delete invalid email after archive.",
-    });
-    return false;
-  }
-
-  return true;
+  return !error;
 }
 
-async function updateProspectValidation(
-  id: string | number,
-  values: Record<string, unknown>,
+async function rerankContactsForProspects(
+  supabase: SupabaseClient,
+  prospectIds: string[],
 ) {
-  const supabase = createSupabaseServerClient();
-  const { error } = await supabase.from("prospects").update(values).eq("id", id);
-  return !error;
+  const uniqueProspectIds = uniqueStrings(prospectIds);
+
+  if (uniqueProspectIds.length === 0) {
+    return { reranked: 0, errors: [] as string[] };
+  }
+
+  const { data, error } = await supabase
+    .from("prospect_contacts")
+    .select("*")
+    .in("prospect_id", uniqueProspectIds)
+    .order("contact_rank", { ascending: true })
+    .order("created_at", { ascending: true })
+    .limit(10_000);
+
+  if (error) {
+    return { reranked: 0, errors: ["Unable to load contacts for rerank."] };
+  }
+
+  const contactsByProspectId = new Map<string, ProspectContactRecord[]>();
+
+  for (const contact of (data ?? []) as ProspectContactRecord[]) {
+    const prospectId = String(contact.prospect_id ?? "");
+
+    if (!prospectId) {
+      continue;
+    }
+
+    contactsByProspectId.set(prospectId, [
+      ...(contactsByProspectId.get(prospectId) ?? []),
+      contact,
+    ]);
+  }
+
+  let reranked = 0;
+  const errors: string[] = [];
+
+  for (const [prospectId, contacts] of contactsByProspectId) {
+    const sortedContacts = [...contacts].sort(compareValidatedContacts);
+    let changed = false;
+
+    for (const [index, contact] of sortedContacts.entries()) {
+      const nextRank = index + 1;
+      const nextSequencePick = index === 0;
+
+      if (
+        numberValue(contact.contact_rank) === nextRank &&
+        Boolean(contact.sequence_pick) === nextSequencePick
+      ) {
+        continue;
+      }
+
+      const { error: updateError } = await supabase
+        .from("prospect_contacts")
+        .update({
+          contact_rank: nextRank,
+          sequence_pick: nextSequencePick,
+        })
+        .eq("id", contact.id);
+
+      if (updateError) {
+        errors.push(`Unable to rerank contact ${contact.id}.`);
+        continue;
+      }
+
+      changed = true;
+    }
+
+    const bestContact = sortedContacts[0];
+
+    if (bestContact) {
+      const { error: prospectUpdateError } = await supabase
+        .from("prospects")
+        .update({
+          contact_name: getContactName(bestContact) || null,
+          contact_title: stringValue(bestContact.job_title) || null,
+          contact_email: extractEmail(bestContact.email) || null,
+          contact_phone: stringValue(bestContact.phone_number) || null,
+          contact_source_url: stringValue(bestContact.contact_source_url) || null,
+          contact_email_validation_status:
+            normalizeDisplayStatus(bestContact.email_validation_status),
+          email_validation_status:
+            normalizeDisplayStatus(bestContact.email_validation_status),
+        })
+        .eq("id", prospectId);
+
+      if (prospectUpdateError) {
+        errors.push(`Unable to update best contact for prospect ${prospectId}.`);
+      }
+    }
+
+    if (changed) {
+      reranked += 1;
+    }
+  }
+
+  return { reranked, errors };
+}
+
+function compareValidatedContacts(
+  left: ProspectContactRecord,
+  right: ProspectContactRecord,
+) {
+  const scoreDifference =
+    scoreValidatedContact(right) - scoreValidatedContact(left);
+
+  if (scoreDifference !== 0) {
+    return scoreDifference;
+  }
+
+  const rankDifference =
+    contactRankValue(left.contact_rank) - contactRankValue(right.contact_rank);
+
+  if (rankDifference !== 0) {
+    return rankDifference;
+  }
+
+  return stringValue(left.created_at).localeCompare(stringValue(right.created_at));
+}
+
+function scoreValidatedContact(contact: ProspectContactRecord) {
+  const email = extractEmail(contact.email);
+  const status = normalizeStatus(contact.email_validation_status);
+  const roleScore = getRoleScore(contact);
+  const genericPenalty = isGenericEmail(email) ? 180 : 0;
+
+  if (email && status === "valid") {
+    return 1000 + roleScore - genericPenalty;
+  }
+
+  if (email && status !== "invalid") {
+    return 450 + roleScore - Math.round(genericPenalty / 2);
+  }
+
+  if (!email) {
+    return 120 + roleScore;
+  }
+
+  return -500 + roleScore;
+}
+
+function getRoleScore(contact: ProspectContactRecord) {
+  const roleText = normalizeKey(
+    [
+      contact.job_title,
+      contact.first_name,
+      contact.last_name,
+      contact.notes,
+    ]
+      .map(stringValue)
+      .join(" "),
+  );
+
+  if (
+    includesAny(roleText, [
+      "student life",
+      "student activities",
+      "student activity",
+      "clubs",
+      "club",
+      "student organization",
+      "student government",
+      "activities coordinator",
+      "activity coordinator",
+      "after school",
+      "after school care",
+      "programming",
+      "program coordinator",
+    ])
+  ) {
+    return 170;
+  }
+
+  if (
+    includesAny(roleText, [
+      "dean of students",
+      "dean students",
+      "upper school dean",
+      "student dean",
+      "assistant dean",
+    ])
+  ) {
+    return 145;
+  }
+
+  if (
+    includesAny(roleText, [
+      "principal",
+      "assistant principal",
+      "associate principal",
+      "head of school",
+      "assistant head",
+      "school leader",
+    ])
+  ) {
+    return 125;
+  }
+
+  if (
+    includesAny(roleText, [
+      "athletic director",
+      "athletics director",
+      "activities director",
+      "activity director",
+      "operations",
+      "technology",
+      "counselor",
+      "administrator",
+      "administration",
+    ])
+  ) {
+    return 90;
+  }
+
+  if (
+    includesAny(roleText, [
+      "board",
+      "president",
+      "vice president",
+      "founder",
+      "founding",
+      "co founder",
+      "cofounder",
+      "coordinator",
+    ])
+  ) {
+    return 60;
+  }
+
+  if (contact.job_title || contact.first_name || contact.last_name) {
+    return 30;
+  }
+
+  return 0;
+}
+
+function includesAny(value: string, needles: string[]) {
+  return needles.some((needle) => value.includes(needle));
+}
+
+function isGenericEmail(email: string) {
+  const localPart = email.split("@")[0]?.toLowerCase() ?? "";
+
+  return [
+    "info",
+    "office",
+    "contact",
+    "admissions",
+    "admin",
+    "hello",
+    "school",
+    "support",
+  ].includes(localPart);
+}
+
+function contactRankValue(value: unknown) {
+  const rank = numberValue(value);
+
+  return rank && rank > 0 ? rank : Number.MAX_SAFE_INTEGER;
+}
+
+function normalizeDisplayStatus(value: unknown) {
+  const status = normalizeStatus(value);
+
+  if (status === "valid") return "Valid";
+  if (status === "invalid") return "Invalid";
+  if (status === "error") return "Error";
+
+  return "Unknown";
 }
 
 async function checkEmailWithBulkEmailChecker(email: string): Promise<BecResult> {
@@ -371,6 +911,44 @@ async function checkEmailWithBulkEmailChecker(email: string): Promise<BecResult>
   }
 }
 
+function shouldValidateStatus(status: string, retryErrors: boolean) {
+  if (FINAL_STATUSES.has(status)) {
+    return false;
+  }
+
+  if (status === "error") {
+    return retryErrors || VALIDATABLE_STATUSES.has(status);
+  }
+
+  return VALIDATABLE_STATUSES.has(status);
+}
+
+function meetsMinimumStudents(
+  prospect: ProspectRecord,
+  minStudents: number | undefined,
+) {
+  if (!minStudents) {
+    return true;
+  }
+
+  const studentCount =
+    numberFromLooseText(prospect.number_of_students) ??
+    numberFromLooseText(prospect.hs_enrollment) ??
+    numberFromLooseText(prospect.total_enrollment);
+
+  return studentCount !== null && studentCount >= minStudents;
+}
+
+function mapBecStatus(status: string): "Valid" | "Invalid" | "Unknown" | "Error" {
+  const normalized = status.toLowerCase();
+
+  if (normalized === "passed") return "Valid";
+  if (normalized === "failed") return "Invalid";
+  if (normalized === "unknown") return "Unknown";
+
+  return "Error";
+}
+
 function extractEmail(value: unknown) {
   const raw = stringValue(value).trim();
 
@@ -384,23 +962,42 @@ function extractEmail(value: unknown) {
   );
 }
 
-function shouldValidateRow(prospect: ProspectRecord) {
-  const emailStatus = stringValue(prospect.email_validation_status).toLowerCase();
-  const contactStatus = stringValue(
-    prospect.contact_email_validation_status,
-  ).toLowerCase();
+function getContactName(contact: ProspectContactRecord) {
+  return [contact.first_name, contact.last_name]
+    .map((value) => stringValue(value))
+    .filter(Boolean)
+    .join(" ");
+}
 
-  if (FINAL_EMAIL_VALIDATION_STATUSES.has(emailStatus)) {
-    return false;
+function getScopeLabel(
+  options: {
+    prospectIds: string[];
+    runId: string;
+    runIds: string[];
+  },
+  scopedProspectIds: string[] | null,
+) {
+  if (options.prospectIds.length > 0) {
+    return `${options.prospectIds.length} selected prospects`;
   }
 
-  if (emailStatus) {
-    return true;
+  if (options.runIds.length > 0) {
+    return `${options.runIds.length} runs`;
   }
 
-  return (
-    !contactStatus || ALLOWED_CONTACT_VALIDATION_STATUSES.has(contactStatus)
-  );
+  if (options.runId) {
+    return "current run";
+  }
+
+  if (scopedProspectIds) {
+    return `${scopedProspectIds.length} scoped prospects`;
+  }
+
+  return "global unvalidated contacts";
+}
+
+function normalizeStatus(value: unknown) {
+  return stringValue(value).toLowerCase();
 }
 
 function clampLimit(limit: number) {
@@ -415,8 +1012,40 @@ function numberValue(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function numberFromLooseText(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  const normalized = stringValue(value).replace(/[^0-9.]+/g, "");
+
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(normalized);
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function stringValue(value: unknown) {
-  return typeof value === "string" ? value : "";
+  if (typeof value === "string") {
+    return value.trim();
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return "";
+}
+
+function normalizeKey(value: unknown) {
+  return stringValue(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function nullableString(value: unknown) {
@@ -425,6 +1054,10 @@ function nullableString(value: unknown) {
   }
 
   return value;
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
 }
 
 function getSafeError(result: BecResult) {

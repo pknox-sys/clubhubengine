@@ -25,6 +25,10 @@ export type ProspectContactExportRecord = Record<string, unknown> & {
   prospect_id?: string | number | null;
 };
 
+type BuildHubspotCsvOptions = {
+  includeBlockedRows?: boolean;
+};
+
 type ExportContact = {
   firstName: string;
   lastName: string;
@@ -50,8 +54,16 @@ const DEFAULT_RECORD_SOURCE = "Import";
 const DEFAULT_INDUSTRY = "Education Management";
 const DEFAULT_SEQUENCE_NAME = "Club Hub - V1 School Outreach";
 
-export function buildHubspotCsv(prospects: ProspectExportRecord[]) {
-  const rows = uniqueRowsByEmail(prospects.flatMap(buildRowsForProspect));
+export function buildHubspotCsv(
+  prospects: ProspectExportRecord[],
+  options: BuildHubspotCsvOptions = {},
+) {
+  const builtRows = prospects.flatMap((prospect) =>
+    buildRowsForProspect(prospect, options),
+  );
+  const rows = options.includeBlockedRows
+    ? builtRows
+    : uniqueRowsByEmail(builtRows);
   const csvRows = [
     HUBSPOT_EXPORT_HEADERS.map(csvEscape).join(","),
     ...rows.map((row) =>
@@ -62,7 +74,10 @@ export function buildHubspotCsv(prospects: ProspectExportRecord[]) {
   return `${csvRows.join("\r\n")}\r\n`;
 }
 
-function buildRowsForProspect(prospect: ProspectExportRecord) {
+function buildRowsForProspect(
+  prospect: ProspectExportRecord,
+  options: BuildHubspotCsvOptions,
+) {
   const companyName = stringValue(prospect.school_name);
   const companyDomain = normalizeDomain(
     prospect.company_domain_name,
@@ -70,15 +85,27 @@ function buildRowsForProspect(prospect: ProspectExportRecord) {
     prospect.source_url,
   );
 
-  if (!companyName || !companyDomain) {
+  if (!options.includeBlockedRows && (!companyName || !companyDomain)) {
     return [];
   }
 
   const contacts = getContactsForProspect(prospect)
-    .map((contact, index) => normalizeContact(contact, prospect, index))
+    .map((contact, index) =>
+      normalizeContact(contact, prospect, index, options),
+    )
     .filter(
       (contact): contact is ExportContact =>
-        contact !== null && contact.emailValidationStatus !== "Invalid",
+        contact !== null &&
+        (options.includeBlockedRows ||
+          contact.emailValidationStatus !== "Invalid"),
+    )
+    .map((contact) =>
+      options.includeBlockedRows
+        ? addBlockedRowNotes(contact, {
+            companyName,
+            companyDomain,
+          })
+        : contact,
     )
     .sort(compareContacts);
 
@@ -112,7 +139,7 @@ function getContactsForProspect(prospect: ProspectExportRecord) {
         first_name: splitName(prospect.contact_name).firstName,
         last_name: splitName(prospect.contact_name).lastName,
         email: prospect.contact_email,
-        phone_number: prospect.contact_phone,
+        phone_number: prospect.contact_phone || prospect.main_phone,
         job_title: prospect.contact_title,
         contact_owner: DEFAULT_CONTACT_OWNER,
         lead_status: DEFAULT_LEAD_STATUS,
@@ -128,20 +155,43 @@ function getContactsForProspect(prospect: ProspectExportRecord) {
     ];
   }
 
-  return [];
+  return [
+    {
+      first_name: "",
+      last_name: "",
+      email: prospect.contact_email,
+      phone_number: prospect.contact_phone || prospect.main_phone,
+      job_title: prospect.contact_title,
+      contact_owner: DEFAULT_CONTACT_OWNER,
+      lead_status: DEFAULT_LEAD_STATUS,
+      contact_rank: 1,
+      sequence_name: DEFAULT_SEQUENCE_NAME,
+      email_validation_status:
+        prospect.email_validation_status ??
+        prospect.contact_email_validation_status ??
+        "Unknown",
+      best_contact_reason:
+        "Fallback row for selected prospect; no named exportable contact was found.",
+      contact_source_url: prospect.contact_source_url,
+      contact_confidence: prospect.contact_confidence,
+      notes:
+        "Selected prospect exported with missing contact data; verify before HubSpot import.",
+    },
+  ];
 }
 
 function normalizeContact(
   contact: Record<string, unknown>,
   prospect: ProspectExportRecord,
   index: number,
+  options: BuildHubspotCsvOptions,
 ): ExportContact | null {
   const legacyName = splitName(prospect.contact_name);
   const firstName = stringValue(contact.first_name) || legacyName.firstName;
   const lastName = stringValue(contact.last_name) || legacyName.lastName;
   const email = normalizeEmail(contact.email);
 
-  if (!email) {
+  if (!email && !options.includeBlockedRows) {
     return null;
   }
 
@@ -165,6 +215,40 @@ function normalizeContact(
     contactConfidence: stringValue(contact.contact_confidence),
     notes: stringValue(contact.notes),
     createdAt: stringValue(contact.created_at),
+  };
+}
+
+function addBlockedRowNotes(
+  contact: ExportContact,
+  values: { companyName: string; companyDomain: string },
+) {
+  const blockerNotes: string[] = [];
+
+  if (!contact.email) {
+    blockerNotes.push("Missing contact email.");
+  }
+
+  if (contact.emailValidationStatus === "Invalid") {
+    blockerNotes.push("Email marked Invalid.");
+  }
+
+  if (!values.companyName) {
+    blockerNotes.push("Missing company name.");
+  }
+
+  if (!values.companyDomain) {
+    blockerNotes.push("Missing company domain.");
+  }
+
+  if (blockerNotes.length === 0) {
+    return contact;
+  }
+
+  return {
+    ...contact,
+    notes: [contact.notes, `Export blocker: ${blockerNotes.join(" ")}`]
+      .filter(Boolean)
+      .join(" "),
   };
 }
 
@@ -307,6 +391,11 @@ function uniqueRowsByEmail(
 
   for (const row of rows) {
     const email = row.Email.toLowerCase();
+
+    if (!email) {
+      uniqueRows.push(row);
+      continue;
+    }
 
     if (seenEmails.has(email)) {
       continue;

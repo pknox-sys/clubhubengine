@@ -3,11 +3,13 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   normalizeEmail,
   normalizeEmailValidationStatus,
+  normalizeDomain,
   stringValue,
 } from "@/lib/hubspot/normalizers";
 
 export type ProspectFilters = {
   runId?: string;
+  runIds?: string[];
   prospectIds?: string[];
   city?: string;
   state?: string;
@@ -18,6 +20,9 @@ export type ProspectFilters = {
   contactRank?: number;
   dataConfidence?: string;
   hasEmail?: boolean;
+  minStudents?: number;
+  companyDomain?: string;
+  exportReadiness?: string;
 };
 
 export type ProspectRecord = Record<string, unknown> & {
@@ -38,12 +43,17 @@ type LoadOptions = {
 export function parseProspectFilters(searchParams: URLSearchParams) {
   const filters: ProspectFilters = {};
   const runId = getParam(searchParams, "runId");
+  const runIds = getParam(searchParams, "runIds")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
   const prospectIds = getParam(searchParams, "prospectIds")
     .split(",")
     .map((id) => id.trim())
     .filter(Boolean);
 
   if (runId) filters.runId = runId;
+  if (runIds.length > 0) filters.runIds = runIds;
   if (prospectIds.length > 0) filters.prospectIds = prospectIds;
   setStringFilter(filters, "city", searchParams);
   setStringFilter(filters, "state", searchParams);
@@ -51,6 +61,8 @@ export function parseProspectFilters(searchParams: URLSearchParams) {
   setStringFilter(filters, "enrichmentStatus", searchParams);
   setStringFilter(filters, "emailValidationStatus", searchParams);
   setStringFilter(filters, "dataConfidence", searchParams);
+  setStringFilter(filters, "companyDomain", searchParams);
+  setStringFilter(filters, "exportReadiness", searchParams);
 
   const sequencePick = getParam(searchParams, "sequencePick");
 
@@ -68,6 +80,12 @@ export function parseProspectFilters(searchParams: URLSearchParams) {
 
   if (Number.isFinite(contactRank) && contactRank > 0) {
     filters.contactRank = contactRank;
+  }
+
+  const minStudents = Number.parseInt(getParam(searchParams, "minStudents"), 10);
+
+  if (Number.isFinite(minStudents) && minStudents > 0) {
+    filters.minStudents = minStudents;
   }
 
   return filters;
@@ -194,14 +212,21 @@ async function getCandidateProspectIds(
     return filters.prospectIds;
   }
 
-  if (!filters.runId) {
+  const runIds = Array.from(
+    new Set([
+      ...(filters.runIds ?? []),
+      ...(filters.runId ? [filters.runId] : []),
+    ]),
+  );
+
+  if (runIds.length === 0) {
     return null;
   }
 
   const { data, error } = await supabase
     .from("prospect_run_prospects")
     .select("prospect_id")
-    .eq("run_id", filters.runId)
+    .in("run_id", runIds)
     .limit(10_000);
 
   if (error) {
@@ -291,6 +316,38 @@ function doesProspectMatchFilters(
     const hasEmail = hasUsableProspectEmail(prospect);
 
     if (hasEmail !== filters.hasEmail) {
+      return false;
+    }
+  }
+
+  if (filters.minStudents !== undefined) {
+    const studentCount = getProspectStudentCount(prospect);
+
+    if (studentCount === null || studentCount < filters.minStudents) {
+      return false;
+    }
+  }
+
+  if (filters.companyDomain) {
+    const hasDomain = Boolean(getProspectCompanyDomain(prospect));
+
+    if (filters.companyDomain === "has" && !hasDomain) {
+      return false;
+    }
+
+    if (filters.companyDomain === "missing" && hasDomain) {
+      return false;
+    }
+  }
+
+  if (filters.exportReadiness) {
+    const isReady = isProspectExportReady(prospect);
+
+    if (filters.exportReadiness === "ready" && !isReady) {
+      return false;
+    }
+
+    if (filters.exportReadiness === "missing" && isReady) {
       return false;
     }
   }
@@ -391,6 +448,67 @@ function hasUsableProspectEmail(prospect: ProspectRecord) {
   );
 }
 
+function isProspectExportReady(prospect: ProspectRecord) {
+  return Boolean(
+    stringValue(prospect.school_name) &&
+      getProspectCompanyDomain(prospect) &&
+      hasNonInvalidContactEmail(prospect),
+  );
+}
+
+function getProspectCompanyDomain(prospect: ProspectRecord) {
+  return normalizeDomain(
+    prospect.company_domain_name,
+    prospect.website,
+    prospect.source_url,
+  );
+}
+
+function hasNonInvalidContactEmail(prospect: ProspectRecord) {
+  const contacts = prospect.prospect_contacts ?? [];
+
+  if (contacts.length > 0) {
+    return contacts.some(
+      (contact) =>
+        Boolean(normalizeEmail(contact.email)) &&
+        normalizeEmailValidationStatus(contact.email_validation_status) !==
+          "Invalid",
+    );
+  }
+
+  return (
+    Boolean(normalizeEmail(prospect.contact_email)) &&
+    normalizeEmailValidationStatus(
+      prospect.email_validation_status ||
+        prospect.contact_email_validation_status,
+    ) !== "Invalid"
+  );
+}
+
+function getProspectStudentCount(prospect: ProspectRecord) {
+  return (
+    numberFromLooseText(prospect.number_of_students) ??
+    numberFromLooseText(prospect.hs_enrollment) ??
+    numberFromLooseText(prospect.total_enrollment)
+  );
+}
+
+function numberFromLooseText(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  const normalized = stringValue(value).replace(/[^0-9.]+/g, "");
+
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(normalized);
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function getSortedContacts(contacts: ProspectContactRecord[]) {
   return [...contacts].sort((left, right) => {
     const rankDifference = numberValue(left.contact_rank) - numberValue(right.contact_rank);
@@ -435,7 +553,9 @@ function setStringFilter(
     | "schoolType"
     | "enrichmentStatus"
     | "emailValidationStatus"
-    | "dataConfidence",
+    | "dataConfidence"
+    | "companyDomain"
+    | "exportReadiness",
   searchParams: URLSearchParams,
 ) {
   const value = getParam(searchParams, key);

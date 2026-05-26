@@ -148,6 +148,18 @@ const contactProperties = {
     "Person-specific school/work email when public or safely pattern-inferred. Leave null when no email is available; do not drop the contact.",
   ),
   email_source: emailSource,
+  email_pattern_domain: described(
+    nullableString,
+    "Domain used for a public staff email pattern, such as chsd218.org. Null when no pattern was found or used.",
+  ),
+  email_pattern_example: described(
+    nullableString,
+    "One public adult staff email proving the pattern, such as danita.allen@chsd218.org. Null when no pattern was found or used.",
+  ),
+  email_pattern_evidence: described(
+    nullableString,
+    "Short note naming the public source or observed pattern used to infer this contact's email. Null when no pattern was found or used.",
+  ),
   phone_number: nullableString,
   job_title: described(
     nullableString,
@@ -202,6 +214,9 @@ export const enrichmentContactSchema = z.object({
   last_name: nullableTextSchema,
   email: nullableTextSchema,
   email_source: z.enum(["public_source", "pattern_inferred", ""]).nullable(),
+  email_pattern_domain: nullableTextSchema,
+  email_pattern_example: nullableTextSchema,
+  email_pattern_evidence: nullableTextSchema,
   phone_number: nullableTextSchema,
   job_title: nullableTextSchema,
   contact_rank: z.number().int().nullable(),

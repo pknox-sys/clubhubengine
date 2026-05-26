@@ -25,7 +25,7 @@ export async function GET(request: Request) {
       return jsonError("Supabase select failure.", 500);
     }
 
-    return csvResponse(buildHubspotCsv(prospects));
+    return csvResponse(buildHubspotCsv(prospects, { includeBlockedRows: true }));
   } catch (error) {
     if (error instanceof MissingServerEnvError) {
       return jsonError(`Missing ${error.envName}`, 500);
