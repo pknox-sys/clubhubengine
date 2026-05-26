@@ -14,12 +14,22 @@ export type ProspectListItem = {
   state: string | null;
   school_type: string | null;
   hs_enrollment: number | null;
+  total_enrollment?: number | null;
+  number_of_students?: string | null;
   clubs_count_estimate: number | null;
+  number_of_clubs?: string | null;
   target_persona: string | null;
   contact_name: string | null;
   contact_title: string | null;
   contact_email: string | null;
+  contact_phone?: string | null;
   fit_score: number | null;
+  data_confidence?: string | null;
+  company_domain_name?: string | null;
+  reference_school?: string | null;
+  ai_fit_reason?: string | null;
+  personalization_angle?: string | null;
+  updated_at?: string | null;
   enrichment_error: string | null;
   email_validation_error: string | null;
   enriched_at: string | null;
@@ -27,6 +37,43 @@ export type ProspectListItem = {
   contact_email_validation_status: string | null;
   email_validation_status: string | null;
   dedupe_key: string | null;
+  best_contact_id?: string | number | null;
+  best_contact_first_name?: string | null;
+  best_contact_last_name?: string | null;
+  best_contact_name?: string | null;
+  best_contact_email?: string | null;
+  best_contact_title?: string | null;
+  best_contact_phone?: string | null;
+  best_contact_rank?: number | null;
+  best_contact_sequence_pick?: boolean | null;
+  best_contact_email_validation_status?: string | null;
+  best_contact_reason?: string | null;
+  best_contact_confidence?: string | null;
+  best_contact_notes?: string | null;
+  contact_count?: number;
+  prospect_contacts?: ProspectContactListItem[];
+};
+
+export type ProspectContactListItem = {
+  id?: string | number;
+  prospect_id?: string | number | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  email?: string | null;
+  phone_number?: string | null;
+  job_title?: string | null;
+  contact_owner?: string | null;
+  lead_status?: string | null;
+  contact_rank?: number | null;
+  sequence_pick?: boolean | null;
+  sequence_name?: string | null;
+  best_contact_reason?: string | null;
+  email_validation_status?: string | null;
+  contact_source_url?: string | null;
+  contact_confidence?: string | null;
+  notes?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 export type ProspectInsertRow = {

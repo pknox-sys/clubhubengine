@@ -10,6 +10,11 @@ import {
   createSupabaseServerClient,
   MissingServerEnvError,
 } from "@/lib/supabaseServer";
+import {
+  getDisplayProspect,
+  loadProspectsForFilters,
+  parseProspectFilters,
+} from "@/lib/prospects/prospectQuery";
 import type { ProspectInsertRow, ProspectListItem } from "@/types/prospect";
 
 export const dynamic = "force-dynamic";
@@ -52,20 +57,23 @@ const searchSchema = z.object({
   state: z.string().trim().min(2, "State must be at least 2 characters."),
 });
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const supabase = createSupabaseServerClient();
-    const { data, error } = await supabase
-      .from("prospects")
-      .select(PROSPECT_SELECT_FIELDS)
-      .order("created_at", { ascending: false })
-      .limit(50);
+    const filters = parseProspectFilters(new URL(request.url).searchParams);
+    const { prospects, error } = await loadProspectsForFilters(
+      supabase,
+      filters,
+      { limit: 50 },
+    );
 
     if (error) {
       return jsonError("Supabase save failure while loading prospects.", 500);
     }
 
-    return Response.json({ prospects: data ?? [] });
+    return Response.json({
+      prospects: prospects.map(getDisplayProspect),
+    });
   } catch (error) {
     return handleRouteError(error);
   }
@@ -87,22 +95,98 @@ export async function POST(request: Request) {
     const state =
       trimmedState.length <= 3 ? trimmedState.toUpperCase() : trimmedState;
     const textQuery = `${keyword} ${city} ${state}`;
+    const supabase = createSupabaseServerClient();
+    const run = await createProspectRun(supabase, { keyword, city, state });
     const googleResponse = await searchGooglePlaces(textQuery);
     const places = googleResponse.places ?? [];
 
     if (places.length === 0) {
+      await updateProspectRunCounts(supabase, run.id, 0, 0);
       return jsonError("Google Places API returned no places.", 404);
     }
 
     const rows = places.map((place) =>
       mapGooglePlaceToProspect(place, { keyword, city, state }),
     );
-    const supabase = createSupabaseServerClient();
     const prospects = await saveProspects(supabase, rows);
+    await linkProspectsToRun(supabase, run.id, prospects);
+    await updateProspectRunCounts(supabase, run.id, places.length, prospects.length);
 
-    return Response.json({ count: prospects.length, prospects });
+    return Response.json({
+      count: prospects.length,
+      run_id: run.id,
+      run_name: run.name,
+      prospects,
+    });
   } catch (error) {
     return handleRouteError(error);
+  }
+}
+
+async function createProspectRun(
+  supabase: SupabaseClient,
+  values: { keyword: string; city: string; state: string },
+) {
+  const name = `${values.city} — ${values.keyword} — ${formatRunTimestamp(new Date())}`;
+  const { data, error } = await supabase
+    .from("prospect_runs")
+    .insert({
+      name,
+      keyword: values.keyword,
+      city: values.city,
+      state: values.state,
+      status: "running",
+    })
+    .select("id, name")
+    .single();
+
+  if (error || !data) {
+    throw new Error("Supabase run save failure.");
+  }
+
+  return data as { id: string; name: string };
+}
+
+async function updateProspectRunCounts(
+  supabase: SupabaseClient,
+  runId: string,
+  resultCount: number,
+  savedCount: number,
+) {
+  const { error } = await supabase
+    .from("prospect_runs")
+    .update({
+      result_count: resultCount,
+      saved_count: savedCount,
+      status: "completed",
+    })
+    .eq("id", runId);
+
+  if (error) {
+    throw new Error("Supabase run save failure.");
+  }
+}
+
+async function linkProspectsToRun(
+  supabase: SupabaseClient,
+  runId: string,
+  prospects: ProspectListItem[],
+) {
+  if (prospects.length === 0) {
+    return;
+  }
+
+  const rows = prospects.map((prospect) => ({
+    run_id: runId,
+    prospect_id: prospect.id,
+    google_place_id: prospect.google_place_id,
+  }));
+  const { error } = await supabase
+    .from("prospect_run_prospects")
+    .upsert(rows, { onConflict: "run_id,prospect_id" });
+
+  if (error) {
+    throw new Error("Supabase run save failure.");
   }
 }
 
@@ -205,9 +289,32 @@ function handleRouteError(error: unknown) {
     return jsonError("Supabase save failure.", 500);
   }
 
+  if (error instanceof Error && error.message === "Supabase run save failure.") {
+    return jsonError("Supabase run save failure.", 500);
+  }
+
   return jsonError("Unexpected server error.", 500);
 }
 
 function jsonError(message: string, status: number) {
   return Response.json({ error: message }, { status });
+}
+
+function formatRunTimestamp(date: Date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .formatToParts(date)
+    .reduce<Record<string, string>>((accumulator, part) => {
+      accumulator[part.type] = part.value;
+      return accumulator;
+    }, {});
+
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
