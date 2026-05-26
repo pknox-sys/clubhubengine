@@ -3,6 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   normalizeEmail,
   normalizeEmailValidationStatus,
+  normalizeDomain,
   stringValue,
 } from "@/lib/hubspot/normalizers";
 
@@ -20,6 +21,8 @@ export type ProspectFilters = {
   dataConfidence?: string;
   hasEmail?: boolean;
   minStudents?: number;
+  companyDomain?: string;
+  exportReadiness?: string;
 };
 
 export type ProspectRecord = Record<string, unknown> & {
@@ -58,6 +61,8 @@ export function parseProspectFilters(searchParams: URLSearchParams) {
   setStringFilter(filters, "enrichmentStatus", searchParams);
   setStringFilter(filters, "emailValidationStatus", searchParams);
   setStringFilter(filters, "dataConfidence", searchParams);
+  setStringFilter(filters, "companyDomain", searchParams);
+  setStringFilter(filters, "exportReadiness", searchParams);
 
   const sequencePick = getParam(searchParams, "sequencePick");
 
@@ -323,6 +328,30 @@ function doesProspectMatchFilters(
     }
   }
 
+  if (filters.companyDomain) {
+    const hasDomain = Boolean(getProspectCompanyDomain(prospect));
+
+    if (filters.companyDomain === "has" && !hasDomain) {
+      return false;
+    }
+
+    if (filters.companyDomain === "missing" && hasDomain) {
+      return false;
+    }
+  }
+
+  if (filters.exportReadiness) {
+    const isReady = isProspectExportReady(prospect);
+
+    if (filters.exportReadiness === "ready" && !isReady) {
+      return false;
+    }
+
+    if (filters.exportReadiness === "missing" && isReady) {
+      return false;
+    }
+  }
+
   if (!hasContactSpecificFilter(filters)) {
     return true;
   }
@@ -419,6 +448,43 @@ function hasUsableProspectEmail(prospect: ProspectRecord) {
   );
 }
 
+function isProspectExportReady(prospect: ProspectRecord) {
+  return Boolean(
+    stringValue(prospect.school_name) &&
+      getProspectCompanyDomain(prospect) &&
+      hasNonInvalidContactEmail(prospect),
+  );
+}
+
+function getProspectCompanyDomain(prospect: ProspectRecord) {
+  return normalizeDomain(
+    prospect.company_domain_name,
+    prospect.website,
+    prospect.source_url,
+  );
+}
+
+function hasNonInvalidContactEmail(prospect: ProspectRecord) {
+  const contacts = prospect.prospect_contacts ?? [];
+
+  if (contacts.length > 0) {
+    return contacts.some(
+      (contact) =>
+        Boolean(normalizeEmail(contact.email)) &&
+        normalizeEmailValidationStatus(contact.email_validation_status) !==
+          "Invalid",
+    );
+  }
+
+  return (
+    Boolean(normalizeEmail(prospect.contact_email)) &&
+    normalizeEmailValidationStatus(
+      prospect.email_validation_status ||
+        prospect.contact_email_validation_status,
+    ) !== "Invalid"
+  );
+}
+
 function getProspectStudentCount(prospect: ProspectRecord) {
   return (
     numberFromLooseText(prospect.number_of_students) ??
@@ -487,7 +553,9 @@ function setStringFilter(
     | "schoolType"
     | "enrichmentStatus"
     | "emailValidationStatus"
-    | "dataConfidence",
+    | "dataConfidence"
+    | "companyDomain"
+    | "exportReadiness",
   searchParams: URLSearchParams,
 ) {
   const value = getParam(searchParams, key);

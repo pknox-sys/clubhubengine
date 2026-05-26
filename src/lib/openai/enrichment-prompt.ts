@@ -26,8 +26,9 @@ Source priority:
 
 Required research pass:
 1. Find the official school website and look for profile, facts, admissions, student life, clubs, activities, student organizations, handbook, staff directory, leadership, athletics/activity, and department pages.
-2. Find adult contact candidates before returning JSON. Do not return an empty contacts array unless no adult staff, administrator, faculty, directory, or LinkedIn source can be found.
-3. Search enrollment and club/activity volume from official profile/facts pages first, then Niche, Private School Review, GreatSchools, NCES, state directories, handbooks, and official PDFs.
+2. Find one public adult staff email pattern before returning JSON. Search the verified school domain and parent/district domain for any adult staff email, even if that person is not the target contact.
+3. Find adult contact candidates before returning JSON. Do not return an empty contacts array unless no adult staff, administrator, faculty, directory, or LinkedIn source can be found.
+4. Search enrollment and club/activity volume from official profile/facts pages first, then Niche, Private School Review, GreatSchools, NCES, state directories, handbooks, and official PDFs.
 
 Contact search strategy:
 Find adults most likely to own or influence club operations. Rank contacts by this priority:
@@ -44,8 +45,9 @@ Find adults most likely to own or influence club operations. Rank contacts by th
 
 Contact ranking:
 - Rank contacts at the same school from 1 down.
-- Rank 1 is the best V1 outreach target.
-- sequence_pick should be true only for rank 1 and false for all others. The server will recompute this.
+- Rank 1 should be the best V1 outreach target with the strongest reachable email evidence.
+- If a reasonably ICP adult administrator has a public exact email and higher-fit contacts only have missing or inferred emails, rank the public exact-email contact first.
+- sequence_pick should be true only for rank 1 and false for all others. The server will recompute this and may override your order.
 - best_contact_reason must be one concise sentence explaining why this person is the best target.
 - Return useful contact candidates even when an email is not public. A useful candidate has at least a name, title, source URL, or clear department/role.
 - If a named contact has no public email, set email to null, email_validation_status to Unknown, and notes to include: Email not found; use school main phone or validate pattern manually.
@@ -56,9 +58,13 @@ Email rules:
 - Avoid generic inboxes unless there is no person-specific option: info@, admissions@, office@.
 - Never use private consumer emails: gmail.com, yahoo.com, icloud.com, hotmail.com, outlook.com.
 - If the exact contact email is public, set email_source to public_source.
-- If the exact email is not public, infer a likely school email when you find a clear public school email pattern from other staff at the same domain.
+- If the exact email is not public, infer a likely school or district email when you find a clear public adult staff email pattern from another staff member at the same verified school/district domain.
+- One public adult staff email can establish a pattern when the person's name and email clearly match, such as jane.smith@district.org, jsmith@district.org, or jane@district.org.
+- District-domain inference is allowed when the school website is a subdomain or official site within that district domain. Example: eisenhower.chsd218.org can use adult staff email danita.allen@chsd218.org to infer firstname.lastname@chsd218.org for target contacts if the pattern is clear.
+- For every pattern-inferred email, fill email_pattern_domain, email_pattern_example, and email_pattern_evidence.
 - Pattern-inferred emails must use email_source pattern_inferred, email_validation_status Unknown, and notes must include exactly: Email pattern inferred from public staff emails; needs validation.
 - Do not infer from private or consumer domains.
+- Do not infer from unrelated domains, alumni domains, vendor domains, student email domains, or social-media-only evidence.
 - If no public staff email pattern exists, keep the contact with email null rather than dropping the contact.
 - contact_confidence must not be High solely because of a pattern-inferred email.
 
@@ -120,7 +126,14 @@ Search query playbook:
 - site:[schooldomain] "staff directory"
 - site:[schooldomain] "faculty directory"
 - site:[schooldomain] "@[schooldomain]"
+- site:[schooldomain] email
+- site:[districtdomain] "@[districtdomain]"
+- "[School Name]" "@[schooldomain]"
+- "[School Name]" "@[districtdomain]"
+- "[School Name]" staff email
 - "[First Name] [Last Name]" "[School Name]" email
+- "[First Name] [Last Name]" "@[schooldomain]"
+- "[First Name] [Last Name]" "@[districtdomain]"
 - "[School Name]" Niche
 - "[School Name]" tuition
 - "[School Name]" enrollment

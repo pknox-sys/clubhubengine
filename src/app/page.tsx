@@ -147,6 +147,13 @@ type ValidationResponse = ActionResponse & {
   results?: ValidationResultItem[];
 };
 
+type FixContactRanksResponse = ActionResponse & {
+  checked?: number;
+  fixed?: number;
+  skipped_no_valid_email?: number;
+  errors?: string[];
+};
+
 type ValidationPanel = {
   scope: string;
   message: string;
@@ -170,6 +177,8 @@ type ProspectFilters = {
   dataConfidence: string;
   hasEmail: string;
   minStudents: string;
+  companyDomain: string;
+  exportReadiness: string;
 };
 
 const DEFAULT_KEYWORD = "private high school";
@@ -186,6 +195,8 @@ const EMPTY_FILTERS: ProspectFilters = {
   dataConfidence: "",
   hasEmail: "",
   minStudents: "",
+  companyDomain: "",
+  exportReadiness: "",
 };
 
 export default function Home() {
@@ -194,10 +205,7 @@ export default function Home() {
   const [state, setState] = useState(DEFAULT_STATE);
   const [batchCities, setBatchCities] = useState("");
   const [runs, setRuns] = useState<ProspectRun[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState("");
-  const [selectedProcessRunIds, setSelectedProcessRunIds] = useState<Set<string>>(
-    new Set(),
-  );
+  const [selectedRunIds, setSelectedRunIds] = useState<Set<string>>(new Set());
   const [filters, setFilters] = useState<ProspectFilters>(EMPTY_FILTERS);
   const [prospects, setProspects] = useState<ProspectListItem[]>([]);
   const [selectedProspectIds, setSelectedProspectIds] = useState<Set<string>>(
@@ -218,6 +226,7 @@ export default function Home() {
   const [isEnhancing, setIsEnhancing] = useState(false);
   const [isDedupeRunning, setIsDedupeRunning] = useState(false);
   const [isEmailValidationRunning, setIsEmailValidationRunning] = useState(false);
+  const [isFixingContactRanks, setIsFixingContactRanks] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -240,10 +249,12 @@ export default function Home() {
   }, []);
 
   const loadProspects = useCallback(
-    async (nextRunId = selectedRunId, nextFilters = filters) => {
-      setVisibleProspects(await fetchRecentProspects(nextRunId, nextFilters));
+    async (nextRunIds = selectedRunIds, nextFilters = filters) => {
+      setVisibleProspects(
+        await fetchRecentProspects(Array.from(nextRunIds), nextFilters),
+      );
     },
-    [filters, selectedRunId],
+    [filters, selectedRunIds],
   );
 
   const loadRecentProspects = useCallback(async () => {
@@ -251,9 +262,9 @@ export default function Home() {
     setError("");
 
     try {
-      setSelectedRunId("");
+      setSelectedRunIds(new Set());
       setFilters(EMPTY_FILTERS);
-      setVisibleProspects(await fetchRecentProspects("", EMPTY_FILTERS));
+      setVisibleProspects(await fetchRecentProspects([], EMPTY_FILTERS));
       setSelectedProspectIds(new Set());
       setMessage("");
     } catch (loadError) {
@@ -270,7 +281,7 @@ export default function Home() {
       try {
         const [loadedRuns, loadedProspects] = await Promise.all([
           fetchRuns(),
-          fetchRecentProspects("", EMPTY_FILTERS),
+          fetchRecentProspects([], EMPTY_FILTERS),
         ]);
 
         if (isMounted) {
@@ -311,8 +322,9 @@ export default function Home() {
       await loadRuns();
 
       if (payload.run_id) {
-        setSelectedRunId(payload.run_id);
-        setVisibleProspects(await fetchRecentProspects(payload.run_id, filters));
+        const nextRunIds = [payload.run_id];
+        setSelectedRunIds(new Set(nextRunIds));
+        setVisibleProspects(await fetchRecentProspects(nextRunIds, filters));
       } else {
         setVisibleProspects(payload.prospects ?? []);
       }
@@ -363,8 +375,11 @@ export default function Home() {
     }
 
     await loadRuns();
-    setSelectedRunId("");
-    setVisibleProspects(await fetchRecentProspects("", filters));
+    const createdRunIds = results
+      .map((result) => result.run_id)
+      .filter((runId): runId is string => Boolean(runId));
+    setSelectedRunIds(new Set(createdRunIds));
+    setVisibleProspects(await fetchRecentProspects(createdRunIds, filters));
 
     const runsCreated = results.filter((result) => result.run_id).length;
     const totalProspectsSaved = results.reduce(
@@ -388,13 +403,13 @@ export default function Home() {
     setMessage(message);
   }
 
-  async function handleRunChange(runId: string) {
-    setSelectedRunId(runId);
+  async function handleRunSelectionChange(nextRunIds: Set<string>) {
+    setSelectedRunIds(nextRunIds);
     setIsLoadingRecent(true);
     setError("");
 
     try {
-      await loadProspects(runId, filters);
+      await loadProspects(nextRunIds, filters);
       setMessage("");
     } catch (loadError) {
       setError(getReadableError(loadError));
@@ -413,7 +428,7 @@ export default function Home() {
     setError("");
 
     try {
-      await loadProspects(selectedRunId, nextFilters);
+      await loadProspects(selectedRunIds, nextFilters);
       setMessage("");
     } catch (loadError) {
       setError(getReadableError(loadError));
@@ -491,13 +506,12 @@ export default function Home() {
     );
   }
 
-  async function handleEnhanceCurrentRun() {
-    const runName =
-      runs.find((run) => run.id === selectedRunId)?.name ?? "Current run";
+  async function handleEnhanceSelectedRuns() {
+    const runIds = Array.from(selectedRunIds);
 
     await runEnrichment(
-      { runId: selectedRunId, ...getMinimumStudentsBody(filters) },
-      runName,
+      { runIds, ...getMinimumStudentsBody(filters) },
+      `${runIds.length} selected runs`,
     );
   }
 
@@ -505,15 +519,6 @@ export default function Home() {
     await runEnrichment(
       { prospectIds: prospects.map((prospect) => idKey(prospect.id)) },
       `${prospects.length} loaded / filtered rows`,
-    );
-  }
-
-  async function handleEnhanceSelectedRuns() {
-    const runIds = Array.from(selectedProcessRunIds);
-
-    await runEnrichment(
-      { runIds, ...getMinimumStudentsBody(filters) },
-      `${runIds.length} selected runs`,
     );
   }
 
@@ -566,13 +571,12 @@ export default function Home() {
     );
   }
 
-  async function handleValidateCurrentRun() {
-    const runName =
-      runs.find((run) => run.id === selectedRunId)?.name ?? "Current run";
+  async function handleValidateSelectedRuns() {
+    const runIds = Array.from(selectedRunIds);
 
     await runEmailValidation(
-      { runId: selectedRunId, ...getMinimumStudentsBody(filters) },
-      runName,
+      { runIds, ...getMinimumStudentsBody(filters) },
+      `${runIds.length} selected runs`,
     );
   }
 
@@ -580,15 +584,6 @@ export default function Home() {
     await runEmailValidation(
       { prospectIds: prospects.map((prospect) => idKey(prospect.id)) },
       `${prospects.length} loaded / filtered rows`,
-    );
-  }
-
-  async function handleValidateSelectedRuns() {
-    const runIds = Array.from(selectedProcessRunIds);
-
-    await runEmailValidation(
-      { runIds, ...getMinimumStudentsBody(filters) },
-      `${runIds.length} selected runs`,
     );
   }
 
@@ -654,24 +649,49 @@ export default function Home() {
     }
   }
 
+  async function handleFixContactRanks() {
+    const prospectIds =
+      selectedProspectIds.size > 0
+        ? Array.from(selectedProspectIds)
+        : prospects.map((prospect) => idKey(prospect.id));
+
+    setIsFixingContactRanks(true);
+    setMessage("");
+    setError("");
+
+    try {
+      const response = await fetch("/api/prospects/fix-contact-ranks", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ prospectIds }),
+      });
+      const payload = (await response.json()) as FixContactRanksResponse;
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Unable to fix contact ranks.");
+      }
+
+      await loadProspects();
+      setMessage(payload.message ?? "Contact ranks fixed.");
+    } catch (fixError) {
+      setError(getReadableError(fixError));
+    } finally {
+      setIsFixingContactRanks(false);
+    }
+  }
+
   function handleDownloadHubSpotCsv() {
     const params =
       selectedProspectIds.size > 0
         ? new URLSearchParams({
             prospectIds: Array.from(selectedProspectIds).join(","),
           })
-        : buildProspectQueryParams(selectedRunId, filters);
+        : buildProspectQueryParams(Array.from(selectedRunIds), filters);
     const query = params.toString();
 
     window.location.href = `/api/prospects/export-hubspot${query ? `?${query}` : ""}`;
-  }
-
-  function handleExportSelectedRuns() {
-    const params = buildProspectQueryParams("", filters);
-    params.set("runIds", Array.from(selectedProcessRunIds).join(","));
-    const query = params.toString();
-
-    window.location.href = `/api/prospects/export-hubspot?${query}`;
   }
 
   function handleSelectCurrentPage() {
@@ -710,22 +730,20 @@ export default function Home() {
     });
   }
 
-  function handleToggleProcessRun(id: string) {
-    setSelectedProcessRunIds((current) => {
-      const next = new Set(current);
+  function handleToggleRun(id: string) {
+    const next = new Set(selectedRunIds);
 
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
 
-      return next;
-    });
+    void handleRunSelectionChange(next);
   }
 
-  function handleClearProcessRuns() {
-    setSelectedProcessRunIds(new Set());
+  function handleClearRunSelection() {
+    void handleRunSelectionChange(new Set());
   }
 
   const isLoading =
@@ -733,7 +751,8 @@ export default function Home() {
     isSearching ||
     isEnhancing ||
     isDedupeRunning ||
-    isEmailValidationRunning;
+    isEmailValidationRunning ||
+    isFixingContactRanks;
 
   return (
     <main className="min-h-screen bg-slate-50 px-6 py-8 text-slate-950">
@@ -825,17 +844,11 @@ export default function Home() {
           </form>
 
           <div className="mt-5 grid gap-4 border-t border-slate-200 pt-4 md:grid-cols-2 xl:grid-cols-5">
-            <SelectInput
-              label="Run"
-              onChange={handleRunChange}
-              value={selectedRunId}
-              options={[
-                { label: "All Runs", value: "" },
-                ...runs.map((run) => ({
-                  label: run.name,
-                  value: run.id,
-                })),
-              ]}
+            <RunMultiSelect
+              onClear={handleClearRunSelection}
+              onToggle={handleToggleRun}
+              runs={runs}
+              selectedRunIds={selectedRunIds}
             />
             <TextInput
               label="Filter City"
@@ -921,83 +934,32 @@ export default function Home() {
                 { label: "Missing email", value: "false" },
               ]}
             />
+            <SelectInput
+              label="Company Domain"
+              onChange={(value) => handleFilterChange("companyDomain", value)}
+              value={filters.companyDomain}
+              options={[
+                { label: "Any", value: "" },
+                { label: "Has domain", value: "has" },
+                { label: "Missing domain", value: "missing" },
+              ]}
+            />
+            <SelectInput
+              label="Export Readiness"
+              onChange={(value) => handleFilterChange("exportReadiness", value)}
+              value={filters.exportReadiness}
+              options={[
+                { label: "Any", value: "" },
+                { label: "Export-ready", value: "ready" },
+                { label: "Missing blockers", value: "missing" },
+              ]}
+            />
             <TextInput
               label="Minimum Students"
               onChange={(value) => handleFilterChange("minStudents", value)}
               type="number"
               value={filters.minStudents}
             />
-          </div>
-
-          <div className="mt-5 border-t border-slate-200 pt-4">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-              <div>
-                <h2 className="text-sm font-semibold text-slate-900">
-                  Runs to Process
-                </h2>
-                <p className="mt-1 text-xs leading-5 text-slate-500">
-                  Select multiple runs for batch enhancement, validation, or
-                  export. Current filters, including Minimum Students, apply
-                  when sent with run-based actions.
-                </p>
-              </div>
-              <div className="flex flex-wrap gap-3">
-                <ActionButton
-                  className="bg-emerald-700 text-white hover:bg-emerald-800 disabled:bg-emerald-300"
-                  disabled={isLoading || selectedProcessRunIds.size === 0}
-                  onClick={handleEnhanceSelectedRuns}
-                >
-                  Enhance Selected Runs
-                </ActionButton>
-                <ActionButton
-                  className="bg-amber-600 text-white hover:bg-amber-700 disabled:bg-amber-300"
-                  disabled={isLoading || selectedProcessRunIds.size === 0}
-                  onClick={handleValidateSelectedRuns}
-                >
-                  Validate Selected Runs
-                </ActionButton>
-                <ActionButton
-                  className="bg-sky-700 text-white hover:bg-sky-800 disabled:bg-sky-300"
-                  disabled={isLoading || selectedProcessRunIds.size === 0}
-                  onClick={handleExportSelectedRuns}
-                >
-                  Export Selected Runs
-                </ActionButton>
-                <ActionButton
-                  disabled={isLoading || selectedProcessRunIds.size === 0}
-                  onClick={handleClearProcessRuns}
-                >
-                  Clear Runs
-                </ActionButton>
-              </div>
-            </div>
-            <div className="mt-3 grid max-h-44 gap-2 overflow-y-auto rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-2 xl:grid-cols-3">
-              {runs.length > 0 ? (
-                runs.map((run) => (
-                  <label
-                    className="flex items-start gap-2 rounded-md bg-white p-2 text-xs text-slate-700"
-                    key={run.id}
-                  >
-                    <input
-                      checked={selectedProcessRunIds.has(run.id)}
-                      className="mt-1 h-4 w-4"
-                      onChange={() => handleToggleProcessRun(run.id)}
-                      type="checkbox"
-                    />
-                    <span>
-                      <span className="block font-semibold text-slate-900">
-                        {run.name}
-                      </span>
-                      <span className="block text-slate-500">
-                        {run.saved_count ?? 0} saved
-                      </span>
-                    </span>
-                  </label>
-                ))
-              ) : (
-                <p className="text-sm text-slate-500">No runs loaded.</p>
-              )}
-            </div>
           </div>
 
           <div className="mt-5 flex flex-col gap-3 border-t border-slate-200 pt-4">
@@ -1011,10 +973,10 @@ export default function Home() {
               </ActionButton>
               <ActionButton
                 className="bg-emerald-700 text-white hover:bg-emerald-800 disabled:bg-emerald-300"
-                disabled={isLoading || !selectedRunId}
-                onClick={handleEnhanceCurrentRun}
+                disabled={isLoading || selectedRunIds.size === 0}
+                onClick={handleEnhanceSelectedRuns}
               >
-                Enhance Current Run
+                Enhance Selected Runs
               </ActionButton>
               <ActionButton
                 className="bg-emerald-700 text-white hover:bg-emerald-800 disabled:bg-emerald-300"
@@ -1025,9 +987,9 @@ export default function Home() {
               </ActionButton>
             </div>
             <p className="text-xs leading-5 text-slate-500">
-              Scoped enrichment targets selected rows first, then the current
-              run or loaded filtered rows. The general enhancement button keeps
-              the original unenriched-prospect behavior.
+              Scoped enrichment targets selected rows first, then selected runs
+              or loaded filtered rows. The general enhancement button keeps the
+              original unenriched-prospect behavior.
             </p>
             <div className="flex flex-wrap gap-3">
               <ActionButton
@@ -1039,10 +1001,10 @@ export default function Home() {
               </ActionButton>
               <ActionButton
                 className="bg-amber-600 text-white hover:bg-amber-700 disabled:bg-amber-300"
-                disabled={isLoading || !selectedRunId}
-                onClick={handleValidateCurrentRun}
+                disabled={isLoading || selectedRunIds.size === 0}
+                onClick={handleValidateSelectedRuns}
               >
-                Validate Current Run
+                Validate Selected Runs
               </ActionButton>
               <ActionButton
                 className="bg-amber-600 text-white hover:bg-amber-700 disabled:bg-amber-300"
@@ -1051,10 +1013,20 @@ export default function Home() {
               >
                 Validate All Loaded / Filtered Rows
               </ActionButton>
+              <ActionButton
+                className="bg-violet-700 text-white hover:bg-violet-800 disabled:bg-violet-300"
+                disabled={isLoading || prospects.length === 0}
+                onClick={handleFixContactRanks}
+              >
+                {isFixingContactRanks
+                  ? "Fixing Contact Ranks..."
+                  : "Fix Contact Rank + Sequence Pick"}
+              </ActionButton>
             </div>
             <p className="text-xs leading-5 text-slate-500">
               Validation updates linked contact rows in place. Invalid contacts
-              stay visible but are excluded from HubSpot export.
+              stay visible but are excluded from HubSpot export. The rank fix
+              promotes the highest-ranked valid email contact to sequence pick.
             </p>
           </div>
 
@@ -1098,7 +1070,7 @@ export default function Home() {
                 onClick={handleSelectCurrentPage}
                 type="button"
               >
-                Select Current Page
+                Select Current View
               </button>
               <button
                 className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-900 transition hover:bg-slate-100"
@@ -1639,6 +1611,80 @@ function SelectInput({
   );
 }
 
+function RunMultiSelect({
+  onClear,
+  onToggle,
+  runs,
+  selectedRunIds,
+}: {
+  onClear: () => void;
+  onToggle: (runId: string) => void;
+  runs: ProspectRun[];
+  selectedRunIds: Set<string>;
+}) {
+  const summary =
+    selectedRunIds.size === 0
+      ? "All Runs"
+      : selectedRunIds.size === 1
+        ? "1 run selected"
+        : `${selectedRunIds.size} runs selected`;
+
+  return (
+    <fieldset className="flex flex-col gap-2 text-sm font-medium text-slate-700">
+      <legend>Run</legend>
+      <details className="group rounded-md border border-slate-300 bg-white">
+        <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-sm text-slate-900 marker:hidden">
+          <span className="font-semibold">{summary}</span>
+          <span
+            aria-hidden="true"
+            className="text-xs text-slate-500 transition group-open:rotate-180"
+          >
+            v
+          </span>
+        </summary>
+        <div className="border-t border-slate-200 p-2">
+          <label className="mb-2 flex min-h-9 items-center gap-2 rounded-md px-2 text-sm text-slate-900 hover:bg-slate-50">
+            <input
+              checked={selectedRunIds.size === 0}
+              className="h-4 w-4"
+              onChange={onClear}
+              type="checkbox"
+            />
+            <span className="font-semibold">All Runs</span>
+          </label>
+          <div className="max-h-44 overflow-y-auto">
+            {runs.length > 0 ? (
+              runs.map((run) => (
+                <label
+                  className="flex items-start gap-2 rounded-md px-2 py-2 text-xs text-slate-700 hover:bg-slate-50"
+                  key={run.id}
+              >
+                <input
+                  checked={selectedRunIds.has(run.id)}
+                  className="mt-0.5 h-4 w-4"
+                  onChange={() => onToggle(run.id)}
+                  type="checkbox"
+                />
+                <span>
+                  <span className="block font-semibold text-slate-900">
+                    {run.name}
+                  </span>
+                  <span className="block text-slate-500">
+                    {run.saved_count ?? 0} saved
+                  </span>
+                </span>
+              </label>
+            ))
+            ) : (
+              <p className="px-2 py-3 text-xs text-slate-500">No runs loaded.</p>
+            )}
+          </div>
+        </div>
+      </details>
+    </fieldset>
+  );
+}
+
 function ActionButton({
   children,
   className = "border border-slate-300 bg-white text-slate-900 hover:bg-slate-100 disabled:text-slate-400",
@@ -1775,8 +1821,8 @@ function getBestContactEmail(prospect: ProspectListItem) {
   return prospect.best_contact_email || prospect.contact_email || "";
 }
 
-async function fetchRecentProspects(runId: string, filters: ProspectFilters) {
-  const params = buildProspectQueryParams(runId, filters);
+async function fetchRecentProspects(runIds: string[], filters: ProspectFilters) {
+  const params = buildProspectQueryParams(runIds, filters);
   const query = params.toString();
   const response = await fetch(
     `/api/prospects/google-search${query ? `?${query}` : ""}`,
@@ -1874,11 +1920,11 @@ function parseBatchCities(input: string, fallbackState: string) {
     });
 }
 
-function buildProspectQueryParams(runId: string, filters: ProspectFilters) {
+function buildProspectQueryParams(runIds: string[], filters: ProspectFilters) {
   const params = new URLSearchParams();
 
-  if (runId) {
-    params.set("runId", runId);
+  if (runIds.length > 0) {
+    params.set("runIds", runIds.join(","));
   }
 
   for (const [key, value] of Object.entries(filters)) {

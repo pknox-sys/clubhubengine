@@ -61,11 +61,7 @@ export async function GET(request: Request) {
   try {
     const supabase = createSupabaseServerClient();
     const filters = parseProspectFilters(new URL(request.url).searchParams);
-    const { prospects, error } = await loadProspectsForFilters(
-      supabase,
-      filters,
-      { limit: 50 },
-    );
+    const { prospects, error } = await loadProspectsForFilters(supabase, filters);
 
     if (error) {
       return jsonError("Supabase save failure while loading prospects.", 500);

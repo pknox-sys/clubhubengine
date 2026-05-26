@@ -23,7 +23,13 @@ type ProspectContactRecord = Record<string, unknown> & {
   first_name?: string | null;
   last_name?: string | null;
   email?: string | null;
+  phone_number?: string | null;
+  job_title?: string | null;
+  contact_rank?: number | null;
+  sequence_pick?: boolean | null;
+  contact_source_url?: string | null;
   email_validation_status?: string | null;
+  created_at?: string | null;
 };
 
 type BecResult = {
@@ -136,10 +142,14 @@ export async function POST(request: Request) {
       skipped: skippedResults.length,
     };
     const results: ValidationResultItem[] = [...skippedResults];
+    const affectedProspectIds = new Set<string>(
+      skippedResults.map((result) => String(result.prospect_id)),
+    );
 
     for (const [index, target] of targets.entries()) {
       const result = await validateTargetEmail(supabase, target);
       results.push(result);
+      affectedProspectIds.add(String(result.prospect_id));
 
       if (result.status === "Valid") summary.valid += 1;
       if (result.status === "Invalid") summary.invalid += 1;
@@ -152,10 +162,16 @@ export async function POST(request: Request) {
         await delay(300);
       }
     }
+    const rerankResult = await rerankContactsForProspects(
+      supabase,
+      Array.from(affectedProspectIds),
+    );
 
     return Response.json({
       ...summary,
       scope,
+      reranked_prospects: rerankResult.reranked,
+      rerank_errors: rerankResult.errors,
       results,
       message: `Checked ${summary.checked} emails for ${scope}. Valid: ${summary.valid}. Invalid: ${summary.invalid}. Unknown: ${summary.unknown}. Errors: ${summary.errors}. Skipped: ${summary.skipped}.`,
     });
@@ -559,6 +575,280 @@ async function updateLegacyProspectValidation(
   return !error;
 }
 
+async function rerankContactsForProspects(
+  supabase: SupabaseClient,
+  prospectIds: string[],
+) {
+  const uniqueProspectIds = uniqueStrings(prospectIds);
+
+  if (uniqueProspectIds.length === 0) {
+    return { reranked: 0, errors: [] as string[] };
+  }
+
+  const { data, error } = await supabase
+    .from("prospect_contacts")
+    .select("*")
+    .in("prospect_id", uniqueProspectIds)
+    .order("contact_rank", { ascending: true })
+    .order("created_at", { ascending: true })
+    .limit(10_000);
+
+  if (error) {
+    return { reranked: 0, errors: ["Unable to load contacts for rerank."] };
+  }
+
+  const contactsByProspectId = new Map<string, ProspectContactRecord[]>();
+
+  for (const contact of (data ?? []) as ProspectContactRecord[]) {
+    const prospectId = String(contact.prospect_id ?? "");
+
+    if (!prospectId) {
+      continue;
+    }
+
+    contactsByProspectId.set(prospectId, [
+      ...(contactsByProspectId.get(prospectId) ?? []),
+      contact,
+    ]);
+  }
+
+  let reranked = 0;
+  const errors: string[] = [];
+
+  for (const [prospectId, contacts] of contactsByProspectId) {
+    const sortedContacts = [...contacts].sort(compareValidatedContacts);
+    let changed = false;
+
+    for (const [index, contact] of sortedContacts.entries()) {
+      const nextRank = index + 1;
+      const nextSequencePick = index === 0;
+
+      if (
+        numberValue(contact.contact_rank) === nextRank &&
+        Boolean(contact.sequence_pick) === nextSequencePick
+      ) {
+        continue;
+      }
+
+      const { error: updateError } = await supabase
+        .from("prospect_contacts")
+        .update({
+          contact_rank: nextRank,
+          sequence_pick: nextSequencePick,
+        })
+        .eq("id", contact.id);
+
+      if (updateError) {
+        errors.push(`Unable to rerank contact ${contact.id}.`);
+        continue;
+      }
+
+      changed = true;
+    }
+
+    const bestContact = sortedContacts[0];
+
+    if (bestContact) {
+      const { error: prospectUpdateError } = await supabase
+        .from("prospects")
+        .update({
+          contact_name: getContactName(bestContact) || null,
+          contact_title: stringValue(bestContact.job_title) || null,
+          contact_email: extractEmail(bestContact.email) || null,
+          contact_phone: stringValue(bestContact.phone_number) || null,
+          contact_source_url: stringValue(bestContact.contact_source_url) || null,
+          contact_email_validation_status:
+            normalizeDisplayStatus(bestContact.email_validation_status),
+          email_validation_status:
+            normalizeDisplayStatus(bestContact.email_validation_status),
+        })
+        .eq("id", prospectId);
+
+      if (prospectUpdateError) {
+        errors.push(`Unable to update best contact for prospect ${prospectId}.`);
+      }
+    }
+
+    if (changed) {
+      reranked += 1;
+    }
+  }
+
+  return { reranked, errors };
+}
+
+function compareValidatedContacts(
+  left: ProspectContactRecord,
+  right: ProspectContactRecord,
+) {
+  const scoreDifference =
+    scoreValidatedContact(right) - scoreValidatedContact(left);
+
+  if (scoreDifference !== 0) {
+    return scoreDifference;
+  }
+
+  const rankDifference =
+    contactRankValue(left.contact_rank) - contactRankValue(right.contact_rank);
+
+  if (rankDifference !== 0) {
+    return rankDifference;
+  }
+
+  return stringValue(left.created_at).localeCompare(stringValue(right.created_at));
+}
+
+function scoreValidatedContact(contact: ProspectContactRecord) {
+  const email = extractEmail(contact.email);
+  const status = normalizeStatus(contact.email_validation_status);
+  const roleScore = getRoleScore(contact);
+  const genericPenalty = isGenericEmail(email) ? 180 : 0;
+
+  if (email && status === "valid") {
+    return 1000 + roleScore - genericPenalty;
+  }
+
+  if (email && status !== "invalid") {
+    return 450 + roleScore - Math.round(genericPenalty / 2);
+  }
+
+  if (!email) {
+    return 120 + roleScore;
+  }
+
+  return -500 + roleScore;
+}
+
+function getRoleScore(contact: ProspectContactRecord) {
+  const roleText = normalizeKey(
+    [
+      contact.job_title,
+      contact.first_name,
+      contact.last_name,
+      contact.notes,
+    ]
+      .map(stringValue)
+      .join(" "),
+  );
+
+  if (
+    includesAny(roleText, [
+      "student life",
+      "student activities",
+      "student activity",
+      "clubs",
+      "club",
+      "student organization",
+      "student government",
+      "activities coordinator",
+      "activity coordinator",
+      "after school",
+      "after school care",
+      "programming",
+      "program coordinator",
+    ])
+  ) {
+    return 170;
+  }
+
+  if (
+    includesAny(roleText, [
+      "dean of students",
+      "dean students",
+      "upper school dean",
+      "student dean",
+      "assistant dean",
+    ])
+  ) {
+    return 145;
+  }
+
+  if (
+    includesAny(roleText, [
+      "principal",
+      "assistant principal",
+      "associate principal",
+      "head of school",
+      "assistant head",
+      "school leader",
+    ])
+  ) {
+    return 125;
+  }
+
+  if (
+    includesAny(roleText, [
+      "athletic director",
+      "athletics director",
+      "activities director",
+      "activity director",
+      "operations",
+      "technology",
+      "counselor",
+      "administrator",
+      "administration",
+    ])
+  ) {
+    return 90;
+  }
+
+  if (
+    includesAny(roleText, [
+      "board",
+      "president",
+      "vice president",
+      "founder",
+      "founding",
+      "co founder",
+      "cofounder",
+      "coordinator",
+    ])
+  ) {
+    return 60;
+  }
+
+  if (contact.job_title || contact.first_name || contact.last_name) {
+    return 30;
+  }
+
+  return 0;
+}
+
+function includesAny(value: string, needles: string[]) {
+  return needles.some((needle) => value.includes(needle));
+}
+
+function isGenericEmail(email: string) {
+  const localPart = email.split("@")[0]?.toLowerCase() ?? "";
+
+  return [
+    "info",
+    "office",
+    "contact",
+    "admissions",
+    "admin",
+    "hello",
+    "school",
+    "support",
+  ].includes(localPart);
+}
+
+function contactRankValue(value: unknown) {
+  const rank = numberValue(value);
+
+  return rank && rank > 0 ? rank : Number.MAX_SAFE_INTEGER;
+}
+
+function normalizeDisplayStatus(value: unknown) {
+  const status = normalizeStatus(value);
+
+  if (status === "valid") return "Valid";
+  if (status === "invalid") return "Invalid";
+  if (status === "error") return "Error";
+
+  return "Unknown";
+}
+
 async function checkEmailWithBulkEmailChecker(email: string): Promise<BecResult> {
   const apiKey = process.env.BEC_API_KEY;
 
@@ -748,6 +1038,14 @@ function stringValue(value: unknown) {
   }
 
   return "";
+}
+
+function normalizeKey(value: unknown) {
+  return stringValue(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function nullableString(value: unknown) {
