@@ -65,6 +65,7 @@ src/
     openai/
       enrichment-prompt.ts
       enrichment-schema.ts
+      reference-schools.ts
   types/
     prospect.ts
 docs/
@@ -86,6 +87,7 @@ Important files:
 - `src/lib/hubspot/*`: HubSpot export headers, normalization, and CSV generation.
 - `src/lib/openai/enrichment-schema.ts`: Strict structured output schema and zod validator.
 - `src/lib/openai/enrichment-prompt.ts`: OpenAI enrichment worker instructions.
+- `src/lib/openai/reference-schools.ts`: Club Hub reference school pool for AI matching.
 - `src/types/prospect.ts`: Shared UI/API prospect list item types.
 
 ## 4. Environment Variables
@@ -315,6 +317,7 @@ bec_details
 bec_raw_json
 raw_google_json
 raw_openai_json
+company_domain_name
 company_owner
 street_address
 state_region_code
@@ -662,11 +665,13 @@ Per-prospect flow:
 5. Require completed `web_search_call`.
 6. Parse `response.output_text` as JSON.
 7. Validate parsed JSON with zod.
-8. Update prospect enrichment fields.
-9. Set `enrichment_status = enriched`.
-10. Set `enriched_at`.
-11. On failure, set `enrichment_status = enrichment_failed`.
-12. Continue to the next prospect even if one fails.
+8. Update school/company enrichment fields in `public.prospects`.
+9. Upsert ranked contacts into `public.prospect_contacts` by normalized email.
+10. Preserve legacy homepage contact fields from the rank `1` contact.
+11. Set `enrichment_status = enriched`.
+12. Set `enriched_at`.
+13. On failure, set `enrichment_status = enrichment_failed`.
+14. Continue to the next prospect even if one fails.
 
 OpenAI model:
 
@@ -699,15 +704,52 @@ OpenAI prompt:
 
 - Defined in `src/lib/openai/enrichment-prompt.ts`.
 - Requires web research.
-- Forbids guessing.
 - Forbids student/minor personal data.
-- Forbids invented or pattern-guessed emails.
+- Allows school-domain email pattern inference only when a public staff email pattern exists.
+- Requires pattern-inferred email notes to say validation is needed.
 - Prioritizes official school sources.
+- Uses `src/lib/openai/reference-schools.ts` for reference-school matching.
 
 Enrichment fields written:
 
 ```txt
+company_domain_name
+company_owner
+street_address
+state_region_code
+postal_code
+time_zone
+industry
+company_type
+record_source
 school_type
+religion
+school_structure
+school_structure_boy_girl
+school_structure_day_boarding
+school_divisions
+low_grade
+high_grade
+number_of_students
+number_of_clubs
+list_of_clubs
+clubs_letter_grade
+percent_clubs_get_funding
+percent_lots_of_participation
+percent_plenty_of_clubs
+tuition
+niche_ranking
+number_of_employees_range
+annual_revenue
+subscription_year
+description
+linkedin_company_page
+reference_school
+reference_school_reason
+ai_fit_reason
+source_url
+data_confidence
+export_notes
 grades_served
 hs_enrollment
 total_enrollment
@@ -734,10 +776,18 @@ enriched_at
 enrichment_error
 ```
 
-Contact email validation status after enrichment:
+Contact behavior after enrichment:
 
-- If `contact_email` exists: `public_source_unverified`
-- If no `contact_email`: `unknown`
+- OpenAI returns a `contacts` array ordered by contact rank.
+- The route inserts or updates `public.prospect_contacts` by `(prospect_id, lower(email))`.
+- New contact rows default to:
+  - `contact_owner = Paul Knox`
+  - `lead_status = New`
+  - `sequence_name = Club Hub - V1 School Outreach`
+  - `email_validation_status = Unknown`
+- Only the first ranked contact gets `sequence_pick = true`.
+- Existing contact validation statuses `Valid`, `Unknown`, `Error`, and `Invalid` are preserved.
+- Bulk Email Checker validation for `prospect_contacts` is not part of this route.
 
 Success response:
 
@@ -1155,6 +1205,7 @@ Used only by:
 src/app/api/prospects/enrich/route.ts
 src/lib/openai/enrichment-prompt.ts
 src/lib/openai/enrichment-schema.ts
+src/lib/openai/reference-schools.ts
 ```
 
 Secret:
@@ -1229,7 +1280,7 @@ email_validation_status = not_checked
 ### 11.2 Enriched prospect
 
 ```txt
-prospects raw/failed/null -> OpenAI web search -> prospects enriched
+prospects raw/failed/null -> OpenAI web search -> prospects + prospect_contacts enriched
 ```
 
 Successful status:
@@ -1243,6 +1294,9 @@ Failed status:
 ```txt
 enrichment_status = enrichment_failed
 ```
+
+Successful enrichment can create multiple ranked rows in `public.prospect_contacts`.
+The rank `1` contact is mirrored into legacy `public.prospects.contact_*` fields for the homepage table.
 
 ### 11.3 Duplicate prospect
 
@@ -1440,6 +1494,8 @@ state: IL
    - Best Contact
    - Contact Email
    - Fit Score
+5. Confirm `public.prospect_contacts` has one or more ranked contacts when emails were found.
+6. Confirm only one contact per school has `sequence_pick = true`.
 
 ### 15.4 De-dupe
 

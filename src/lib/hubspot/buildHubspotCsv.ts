@@ -64,7 +64,11 @@ export function buildHubspotCsv(prospects: ProspectExportRecord[]) {
 
 function buildRowsForProspect(prospect: ProspectExportRecord) {
   const companyName = stringValue(prospect.school_name);
-  const companyDomain = normalizeDomain(prospect.website, prospect.source_url);
+  const companyDomain = normalizeDomain(
+    prospect.company_domain_name,
+    prospect.website,
+    prospect.source_url,
+  );
 
   if (!companyName || !companyDomain) {
     return [];

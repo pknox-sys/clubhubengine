@@ -70,6 +70,7 @@ for each row
 execute function public.set_prospect_contacts_updated_at();
 
 alter table public.prospects
+  add column if not exists company_domain_name text,
   add column if not exists company_owner text,
   add column if not exists street_address text,
   add column if not exists state_region_code text,

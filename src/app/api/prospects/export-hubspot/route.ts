@@ -1,8 +1,8 @@
+import { buildHubspotCsv } from "@/lib/hubspot/buildHubspotCsv";
 import {
-  buildHubspotCsv,
-  type ProspectContactExportRecord,
-  type ProspectExportRecord,
-} from "@/lib/hubspot/buildHubspotCsv";
+  loadProspectsForFilters,
+  parseProspectFilters,
+} from "@/lib/prospects/prospectQuery";
 import {
   createSupabaseServerClient,
   MissingServerEnvError,
@@ -11,61 +11,21 @@ import {
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const supabase = createSupabaseServerClient();
-    const { data: prospectsData, error: prospectsError } = await supabase
-      .from("prospects")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(10_000);
+    const filters = parseProspectFilters(new URL(request.url).searchParams);
+    const { prospects, error } = await loadProspectsForFilters(
+      supabase,
+      filters,
+      { narrowContacts: true },
+    );
 
-    if (prospectsError) {
+    if (error) {
       return jsonError("Supabase select failure.", 500);
     }
 
-    const prospects = ((prospectsData ?? []) as ProspectExportRecord[]).filter(
-      (prospect) => prospect.id,
-    );
-
-    if (prospects.length === 0) {
-      return csvResponse(buildHubspotCsv([]));
-    }
-
-    const prospectIds = prospects.map((prospect) => prospect.id);
-    const { data: contactsData, error: contactsError } = await supabase
-      .from("prospect_contacts")
-      .select("*")
-      .in("prospect_id", prospectIds)
-      .order("contact_rank", { ascending: true })
-      .order("created_at", { ascending: true })
-      .limit(10_000);
-
-    if (contactsError) {
-      return jsonError("Supabase contact select failure.", 500);
-    }
-
-    const contactsByProspectId = new Map<string, ProspectContactExportRecord[]>();
-
-    for (const contact of (contactsData ?? []) as ProspectContactExportRecord[]) {
-      const prospectId = String(contact.prospect_id ?? "");
-
-      if (!prospectId) {
-        continue;
-      }
-
-      contactsByProspectId.set(prospectId, [
-        ...(contactsByProspectId.get(prospectId) ?? []),
-        contact,
-      ]);
-    }
-
-    const prospectsWithContacts = prospects.map((prospect) => ({
-      ...prospect,
-      prospect_contacts: contactsByProspectId.get(String(prospect.id)) ?? [],
-    }));
-
-    return csvResponse(buildHubspotCsv(prospectsWithContacts));
+    return csvResponse(buildHubspotCsv(prospects));
   } catch (error) {
     if (error instanceof MissingServerEnvError) {
       return jsonError(`Missing ${error.envName}`, 500);
